@@ -107,9 +107,32 @@ final class HostWeb: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKU
         try {
           if (typeof P === 'object' && P && typeof P.quality === 'number' && P.quality !== quality) {
             P.quality = quality;
-            window.dispatchEvent(new Event('resize'));   // the theme re-sizes its canvas (debounced)
+            rescale();
           }
         } catch (e) {}
+      }
+
+      // Re-render the canvas at the new resolution. Not through the theme's resize(): that rebuilds the scene as if
+      // the screen had changed (skaters, fire crews, animals, the ants' worn trails all start over) on every plug or
+      // unplug. Every theme already supports a plain rescale, because share.js does the same for its snapshot.
+      function rescale() {
+        try {
+          if (typeof cv !== 'object' || !cv || typeof cv._scale !== 'number' || typeof draw !== 'function') throw 0;
+          const scale = Math.min(window.devicePixelRatio || 1, P.quality);
+          if (Math.abs(scale - cv._scale) < 1e-3) return;
+          const box = cv.getBoundingClientRect();
+          cv.width = Math.round((box.width || innerWidth) * scale);
+          cv.height = Math.round((box.height || innerHeight) * scale);
+          cv._scale = scale;
+          // themes that paint labels or cache land on a 2D canvas redraw it at the new size (as in share.js)
+          const labels = typeof renderLabels === 'function' &&
+            ((typeof city !== 'undefined' && city) || (typeof world !== 'undefined' && world));
+          if (labels) renderLabels();
+          if (typeof cacheOK !== 'undefined') cacheOK = false;
+          draw(performance.now());               // resizing cleared the canvas; redraw now even if paused
+        } catch (e) {
+          window.dispatchEvent(new Event('resize'));   // not a theme page we know: let it re-size itself
+        }
       }
 
       // The theme pages time the icon morph with wall-clock time but stop their frame loop while paused,
