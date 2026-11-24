@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.ps
 
 /// A borderless, click-through window at the desktop window level: above the system wallpaper,
 /// below Finder's desktop icons. Shown on every Space of the main display.
@@ -88,7 +89,8 @@ final class PauseMonitor {
         NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder"
     }
 
-    /// Owner of another app's normal-level window that covers (almost) the whole usable area of the main screen.
+    /// Why the desktop can't be seen: one window covers (almost) the whole usable area of the main screen,
+    /// or several windows together leave less than ~5% of it visible. Returns the frontmost covering app's name.
     static func windowCoveringMainScreen() -> String? {
         let screen = WallpaperWindow.mainScreen
         let full = CGRect(origin: .zero, size: screen.frame.size)        // CG coordinates: main screen at (0,0), y down
@@ -96,6 +98,7 @@ final class PauseMonitor {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return nil }
         let me = ProcessInfo.processInfo.processIdentifier
+        var rects: [CGRect] = [], owner: String?
         for w in list {
             guard (w[kCGWindowLayer as String] as? Int) == 0,
                   (w[kCGWindowOwnerPID as String] as? Int32) != me,
@@ -103,10 +106,82 @@ final class PauseMonitor {
                   let b = w[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: b) else { continue }
             let i = r.intersection(full)
-            if i.width >= usable.width - 4 && i.height >= usable.height - 4 {
-                return (w[kCGWindowOwnerName as String] as? String) ?? "?"
+            if i.isNull || i.width < 40 || i.height < 40 { continue }
+            let name = (w[kCGWindowOwnerName as String] as? String) ?? "?"
+            if i.width >= usable.width - 4 && i.height >= usable.height - 4 { return name }
+            rects.append(i)
+            if owner == nil { owner = name }
+        }
+        guard rects.count > 1 else { return nil }
+        // Sample a grid over the usable area (CG y: the menu bar is at the top, the Dock wherever visibleFrame excludes it).
+        let area = CGRect(x: usable.minX - screen.frame.minX, y: screen.frame.maxY - usable.maxY,
+                          width: usable.width, height: usable.height)
+        let nx = 48, ny = 30
+        var visible = 0
+        for iy in 0..<ny {
+            for ix in 0..<nx {
+                let p = CGPoint(x: area.minX + (CGFloat(ix) + 0.5) * area.width / CGFloat(nx),
+                                y: area.minY + (CGFloat(iy) + 0.5) * area.height / CGFloat(ny))
+                if !rects.contains(where: { $0.contains(p) }) { visible += 1 }
             }
         }
-        return nil
+        return Double(visible) / Double(nx * ny) < 0.05 ? "\(owner ?? "?") and others" : nil
+    }
+}
+
+/// Picks how hard the wallpaper may work: full quality on power, fewer frames and pixels on battery,
+/// and the bare minimum in Low Power Mode. ICONLAND_POWER=full|battery|low overrides it (for testing).
+final class PowerMonitor {
+    enum Mode: String { case full, battery, low }
+
+    struct Profile { let fps: Int; let quality: Double }
+    static func profile(_ m: Mode) -> Profile {
+        switch m {
+        case .full: return Profile(fps: 30, quality: 2)        // the themes' own defaults
+        case .battery: return Profile(fps: 24, quality: 1.5)   // ~45% of the GPU work
+        case .low: return Profile(fps: 15, quality: 1.25)      // ~20%
+        }
+    }
+
+    var onChange: ((Mode) -> Void)?
+    private(set) var mode: Mode = .full
+    private var source: CFRunLoopSource?
+
+    init() {
+        mode = Self.current()
+        Log.write("power: \(mode.rawValue)")
+        NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [weak self] _ in
+            self?.evaluate()
+        }
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        if let s = IOPSNotificationCreateRunLoopSource({ ctx in
+            guard let ctx else { return }
+            let me = Unmanaged<PowerMonitor>.fromOpaque(ctx).takeUnretainedValue()
+            DispatchQueue.main.async { me.evaluate() }
+        }, ctx)?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), s, .defaultMode)
+            source = s
+        }
+    }
+
+    deinit {
+        if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode) }
+    }
+
+    func evaluate() {
+        let m = Self.current()
+        guard m != mode else { return }
+        mode = m
+        Log.write("power: \(m.rawValue)")
+        onChange?(m)
+    }
+
+    static func current() -> Mode {
+        if let o = ProcessInfo.processInfo.environment["ICONLAND_POWER"], let m = Mode(rawValue: o) { return m }
+        if ProcessInfo.processInfo.isLowPowerModeEnabled { return .low }
+        let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+        if let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String?,
+           type == kIOPSBatteryPowerValue { return .battery }
+        return .full
     }
 }

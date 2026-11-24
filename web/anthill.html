@@ -1,0 +1,1640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Ant Colony</title>
+<!--
+  Iconland · Ant Colony (a sunny patch of forest floor seen from above; WebGL2)
+  - Ground is STATIC (seed + screen size + details): soil with fine crumbs, pebbles, fallen leaves, pine needles,
+    twigs, grass tufts and clover along the screen edges. It is baked once into a texture (Canvas2D debris over a
+    procedural soil shader) and only cross-faded when the seed or the details setting change.
+  - Every cluster of desktop icons sits on an anthill. Mound field (CPU, only when icons change): gaussian metaballs
+    around the icon rects -> signed distance (<0 on the mound), morphed on the GPU exactly like the other themes
+    (A/B textures, blendFields on a commit mid-transition). The mound is shaded per pixel: dome profile from the
+    distance, a fixed screen-space lattice of soil crumbs and pine needles revealed by the field (they never crawl).
+  - Life (JS): nests = connected mounds, entrance holes on their rim. Ants leave the holes, walk shared routes to
+    food (crumbs, sugar cube, raspberry, leaf), nibble, carry a bit home; others travel between nests or explore.
+    Foods appear now and then and shrink away. Where ants walk, a worn trail builds up (CPU accumulation grid,
+    uploaded every 1.5 s and cross-faded, so it never pops). A ladybug or a ground beetle wanders by now and then.
+  - Rendering: one full-screen pass (ground texture + trails + mounds), then instanced sprites (holes, food, beetle,
+    ants) drawn procedurally in their own local coordinates.
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #6e5640; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.55); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const STEP = 5, TS = 4, TASKBAR = 0;
+const MORPH_MS = 1800, GROW_MS = 2600, GFADE_MS = 1200;
+const S_CLAMP = 120, D_CLAMP = 600;
+const WARP = 24;
+const TR_PERIOD = 1.5, TR_TAU = 300, TR_K = 2.5;
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');
+const PREVIEW = QS.has('preview');
+// Defaults must match themes.json
+const P = {
+  sigma: 55, ants: 0.5, food: 0.5, details: 0.6, trails: 1, speed: 1,
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [30, 120], ants: [0, 1], food: [0, 1], details: [0, 1], trails: [0, 1], speed: [0, 3] };
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[8, 16, 32, 64], [8, 16, 32, 64], [4, 8, 16, 32], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 100 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+const clamp01 = x => x < 0 ? 0 : x > 1 ? 1 : x;
+const rnd = () => Math.random();
+
+/* ======================================================================
+   Field grid noise (seed only)
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+function buildNoise() {
+  const N = Gw * Gh;
+  NZ = { wx: new Float32Array(N), wy: new Float32Array(N), fn: new Float32Array(N) };
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+    NZ.wx[i] = fbm(x * 0.006, y * 0.006, 1) - 0.47;
+    NZ.wy[i] = fbm(x * 0.006, y * 0.006, 2) - 0.47;
+    NZ.fn[i] = fbm(x * 0.02, y * 0.02, 3) - 0.47;
+  }
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+
+/* ======================================================================
+   Mound field (CPU, on icon change): s = signed distance to the mound edge (<0 on the mound)
+   ====================================================================== */
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, f1 = new Float32Array(N);
+  const sig = P.sigma, is1 = 1 / (sig * sig);
+  const wa = WARP * 2.4, wmax = wa * 0.5;
+  for (const r of rects) {
+    const Rf = sig * 1.1 + 150, Rf2 = Rf * Rf;
+    const R = Rf + Math.max(r.hw, r.hh) * 0.5 + wmax;
+    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
+    const chw = r.hw * 0.3, chh = r.hh * 0.3;
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+      const qx = x + NZ.wx[i] * wa, qy = y + NZ.wy[i] * wa;
+      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < Rf2) f1[i] += Math.exp(-d2 * is1);
+    }
+  }
+  // smooth (C1) version of sqrt(max(-g, 0)) - k*max(g, 0): a hard max leaves a visible crease on the shaded dome
+  const sp = x => x > 20 ? x : Math.log1p(Math.exp(3 * x)) / 3;
+  const prof = g => Math.sqrt(sp(-g) + 0.05) - 0.6 * sp(g);
+  const c0 = prof(Math.log(0.35)), s = new Float32Array(N), fMin = Math.exp(-60);
+  for (let i = 0; i < N; i++) {
+    const g = Math.log(Math.max(f1[i], fMin));
+    s[i] = Math.min(D_CLAMP, sig * (prof(g) - c0) + NZ.fn[i] * WARP * 0.8);
+  }
+  // a mound near the screen edge runs on off-screen (no rim along the frame)
+  const M = 40, mx0 = Math.round(M / STEP), my0 = mx0, mx1 = Math.floor((W - M) / STEP), my1 = Math.floor((H - M) / STEP);
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const cx = Math.min(Math.max(gx, mx0), mx1), cy = Math.min(Math.max(gy, my0), my1);
+    if (cx !== gx || cy !== gy) { const i = gy * Gw + gx, v = s[cy * Gw + cx]; if (v < s[i]) s[i] = v; }
+  }
+  // a true distance near the edge (divide by the gradient), so the slope is even all round
+  const out = new Float32Array(N);
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, v = s[i];
+    if (v > 400) { out[i] = v; continue; }
+    const ax = gx > 0 ? s[i - 1] : v, bx = gx < Gw - 1 ? s[i + 1] : v, ay = gy > 0 ? s[i - Gw] : v, by = gy < Gh - 1 ? s[i + Gw] : v;
+    const gm = Math.hypot(bx - ax, by - ay) / (2 * STEP);
+    out[i] = v / (1 + (Math.min(Math.max(gm, 0.5), 2.5) - 1) * sstep(70, 25, Math.abs(v)));
+  }
+  for (let i = 0; i < N; i++) s[i] = out[i] < -S_CLAMP ? -S_CLAMP : out[i];
+  fieldMs = performance.now() - t0;
+  return { s };
+}
+const emptyField = () => ({ s: new Float32Array(Gw * Gh).fill(D_CLAMP) });
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const COMMON = `
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+vec2 hash22(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.xx + p3.yz) * p3.zy);
+}
+float segD(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+`;
+
+// ---- ground bake: soil + debris overlay (static, rendered into a texture) ----
+const FS_BAKE = `#version 300 es
+precision highp float;
+uniform sampler2D uNoise, uOv;
+uniform vec2 uCv;
+uniform float uScale, uSeed;
+out vec4 o;
+${COMMON}
+vec4 N(vec2 p, float scale) { return texture(uNoise, p / scale + uSeed * 0.013); }
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uCv.y - gl_FragCoord.y) / uScale;
+  vec4 n1 = N(p, 1300.0), n2 = N(p, 300.0), n3 = N(p, 70.0), n4 = N(p + 91.0, 760.0);
+  vec3 col = mix(vec3(0.46, 0.345, 0.235), vec3(0.575, 0.44, 0.305), n1.r);
+  col = mix(col, vec3(0.38, 0.28, 0.19), ss(0.55, 0.85, n2.g) * 0.3);       // damp patches
+  col = mix(col, vec3(0.62, 0.50, 0.36), ss(0.6, 0.9, n2.b) * 0.15);        // dry, sandy patches
+  col *= 0.94 + 0.12 * n3.b;
+  // fine soil crumbs
+  const vec2 LD = vec2(-0.5914, -0.8064);
+  float cs = 2.3;
+  vec2 gp = p / cs, ib = floor(gp);
+  float bd = 1e9; vec2 bc = vec2(0.0); float br = 1.0; vec3 bh = vec3(0.0);
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    vec2 c = ib + vec2(float(i), float(j));
+    vec2 hh = hash22(c + 3.7);
+    vec2 cc = c + 0.2 + 0.6 * hh;
+    float r = 0.22 + 0.3 * hash2(c + 9.1);
+    float d = length(gp - cc) - r;
+    if (d < bd) { bd = d; bc = cc; br = r; bh = vec3(hh, hash2(c + 21.7)); }
+  }
+  float aa = 0.8 / uScale;
+  float inG = 1.0 - ss(-aa, aa, bd * cs);
+  vec2 nq = (gp - bc) / br;
+  vec3 gcol = col * (0.9 + 0.2 * bh.x) * (1.0 + 0.14 * dot(nq, LD) - 0.06 * dot(nq, nq));
+  gcol = mix(gcol, vec3(0.70, 0.65, 0.57) * (0.9 + 0.2 * bh.y), step(0.994, bh.z));   // quartz grains
+  col = mix(col * 0.95, gcol, inG);
+  col *= 0.97 + 0.06 * hash2(floor(gl_FragCoord.xy) + 0.5);
+  // dappled sunlight
+  float sun = ss(0.48, 0.74, n4.a);
+  col = mix(col, col * vec3(1.08, 1.05, 0.97), sun);
+  col *= 1.0 - 0.04 * ss(0.62, 0.32, n4.a);
+  vec4 ov = texelFetch(uOv, ivec2(int(gl_FragCoord.x), int(uCv.y - 1.0 - gl_FragCoord.y)), 0);
+  col = ov.rgb + col * (1.0 - ov.a);
+  o = vec4(col, 1.0);
+}`;
+
+// ---- per frame: ground + worn trails + mounds ----
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uG0, uG1, uCA, uCB, uTA, uTB;
+uniform vec2 uCv, uGrid, uTGrid;
+uniform float uScale, uStep, uTS, uMix, uBump, uGMix, uTMix, uTOn, uRH;
+out vec4 o;
+${COMMON}
+float field(vec2 p) { vec2 uv = (p / uStep + 0.5) / uGrid; float a = texture(uCA, uv).r, b = texture(uCB, uv).r; return mix(a, b, uMix) + uBump * abs(a - b); }
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec2 p = vec2(gl_FragCoord.x, uCv.y - gl_FragCoord.y) / uScale;
+  vec3 col = mix(texelFetch(uG0, ip, 0).rgb, texelFetch(uG1, ip, 0).rgb, uGMix);
+  float AA = 0.75 / uScale;
+  if (uTOn > 0.0) {
+    vec2 tuv = (p / uTS + 0.5) / uTGrid;
+    float tr = mix(texture(uTA, tuv).r, texture(uTB, tuv).r, uTMix);
+    float w = ss(0.03, 0.8, tr) * uTOn;
+    col = mix(col, mix(col, vec3(0.64, 0.52, 0.38), 0.5) * 1.06, w * 0.6);   // worn: lighter, smoother soil
+  }
+  float s = field(p);
+  if (s < 70.0) {
+    float sh = field(p - vec2(7.0, 9.0));
+    col *= 1.0 - 0.34 * (1.0 - ss(-16.0, 14.0, sh)) * ss(-8.0, 4.0, s);   // drop shadow, lower right
+    col *= 1.0 - 0.09 * ss(45.0, 4.0, s);                               // freshly dug soil around the hill
+    if (s < 30.0) {
+      float e = 3.0;
+      vec2 g = vec2(field(p + vec2(e, 0.0)) - field(p - vec2(e, 0.0)), field(p + vec2(0.0, e)) - field(p - vec2(0.0, e))) / (2.0 * e);
+      float x = clamp(-s / uRH, 0.0, 1.0);
+      float h = sqrt(x * (2.0 - x));
+      vec2 sl = -g * (1.0 - x) / max(h, 0.2) * 0.9 * (1.0 - ss(-3.0, 4.0, s));
+      sl *= ss(25.0, 70.0, min(min(p.x, p.y), min(uCv.x / uScale - p.x, uCv.y / uScale - p.y)));   // mounds run off-screen flat
+      float sm = length(sl); if (sm > 1.5) sl *= 1.5 / sm;
+      vec3 n = normalize(vec3(-sl, 1.0));
+      const vec3 L = vec3(-0.3819, -0.5208, 0.7638);
+      float lit = clamp(dot(n, L) / 0.7638, 0.55, 1.5) * (0.86 + 0.2 * h);
+      float deep = ss(-30.0, -90.0, s);                    // under the icons: calmer texture
+      lit = mix(lit, 1.0, deep * 0.3);
+      const vec2 LD = vec2(-0.5914, -0.8064);
+      // soil crumbs piled up (fixed lattice, revealed by the field)
+      float cs = 2.6;
+      vec2 gp = p / cs, ib = floor(gp);
+      float bd = 1e9; vec2 bc = vec2(0.0); float br = 1.0; vec4 bh = vec4(0.0);
+      for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+        vec2 c = ib + vec2(float(i), float(j));
+        vec2 hh = hash22(c + 17.0);
+        vec2 cc = c + 0.18 + 0.64 * hh;
+        float r = 0.36 + 0.26 * hash2(c + 3.1);
+        float d = length(gp - cc) - r;
+        if (d < bd) { bd = d; bc = cc; br = r; bh = vec4(hh, hash2(c + 7.7), hash2(c + 11.3)); }
+      }
+      float inG = 1.0 - ss(-AA, AA, bd * cs);
+      vec2 nq = (gp - bc) / br;
+      float thr = (bh.z - 0.5) * 12.0 - 1.0;
+      float vis = 1.0 - ss(thr - 8.0, thr + 8.0, s);
+      float spill = ss(0.0, 0.25, 0.5 * exp(-max(s, 0.0) / 9.0) - bh.w) * ss(34.0, 6.0, s);   // soft: crumbs fade, never pop
+      vis = max(vis, spill);
+      float body = 1.0 - ss(-12.0, 2.0, s);
+      vec3 base = mix(vec3(0.35, 0.245, 0.16), vec3(0.235, 0.16, 0.105), bh.x);
+      base = mix(base, vec3(0.52, 0.36, 0.2), step(0.8, bh.y));      // bits of needles and bark
+      base = mix(base, vec3(0.40, 0.355, 0.30), step(0.97, bh.w) * (1.0 - step(0.8, bh.y)));
+      base = mix(base, vec3(0.30, 0.215, 0.145), deep * 0.45);
+      float gsh = 1.0 + (0.24 * dot(nq, LD) - 0.14 * dot(nq, nq)) * (1.0 - 0.45 * deep);
+      vec3 crev = mix(vec3(0.115, 0.08, 0.05), vec3(0.2, 0.14, 0.09), deep * 0.6);
+      vec3 mc = mix(col, crev * lit, body);
+      mc = mix(mc, base * gsh * lit, inG * vis);
+      // pine needles on the hill
+      float cn = 7.0;
+      vec2 nb = floor(p / cn);
+      float nd = 1e9, nt = 0.0, nl = 0.0;
+      for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+        vec2 c = nb + vec2(float(i), float(j));
+        vec2 h1 = hash22(c + 41.0), h2 = hash22(c + 59.0);
+        if (h1.x < 0.85) {
+          vec2 cc = (c + 0.5 + (h2 - 0.5) * 0.9) * cn;
+          float a = h1.y * 6.2832;
+          vec2 dv = vec2(cos(a), sin(a)) * (3.5 + 4.0 * h2.x);
+          float d = segD(p, cc - dv, cc + dv);
+          if (d < nd) { nd = d; nt = h2.y; nl = h1.x; }
+        }
+      }
+      float ncov = 1.0 - ss(-18.0, -4.0, s + (nt - 0.5) * 10.0);
+      ncov *= 1.0 - 0.55 * deep;
+      float nv = (1.0 - ss(0.5 - AA, 0.5 + AA, nd)) * ncov;
+      float nh = (1.0 - ss(0.5, 1.6, nd)) * ncov;
+      vec3 ncol = mix(vec3(0.64, 0.44, 0.21), vec3(0.45, 0.29, 0.14), nt) * lit;
+      mc *= 1.0 - 0.3 * nh;
+      mc = mix(mc, ncol, nv);
+      col = mc;
+    }
+  }
+  o = vec4(col, 1.0);
+}`;
+
+// ---- instanced sprites: holes, food, beetle, ants (each drawn in its own local coordinates) ----
+const VS_SPR = `#version 300 es
+layout(location = 0) in vec4 iA;   // x, y, angle, size
+layout(location = 1) in vec4 iB;   // kind, phase, alpha, aux
+layout(location = 2) in vec4 iC;   // aux2, aux3, extent (px), aux4
+uniform vec2 uRes;
+uniform float uScale;
+out vec2 vL;
+flat out vec4 vB;
+flat out vec4 vC;
+flat out vec2 vLt;
+flat out vec2 vSh;
+flat out float vAA;
+void main() {
+  vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1)) * 2.0 - 1.0;
+  float ca = cos(iA.z), sa = sin(iA.z);
+  vec2 off = c * iC.z;
+  vec2 pos = iA.xy + vec2(ca * off.x - sa * off.y, sa * off.x + ca * off.y);
+  vL = off / iA.w;
+  gl_Position = vec4(pos.x / uRes.x * 2.0 - 1.0, 1.0 - pos.y / uRes.y * 2.0, 0.0, 1.0);
+  vAA = 0.7 / (iA.w * uScale);
+  vec2 lt = vec2(-0.5914, -0.8064), so = vec2(1.1, 1.5);
+  vLt = vec2(ca * lt.x + sa * lt.y, -sa * lt.x + ca * lt.y);
+  vSh = vec2(ca * so.x + sa * so.y, -sa * so.x + ca * so.y) / iA.w;
+  vB = iB; vC = iC;
+}`;
+
+const FS_SPR = `#version 300 es
+precision highp float;
+in vec2 vL;
+flat in vec4 vB;
+flat in vec4 vC;
+flat in vec2 vLt;
+flat in vec2 vSh;
+flat in float vAA;
+out vec4 o;
+${COMMON}
+float sdE(vec2 p, vec2 c, vec2 r) { return (length((p - c) / r) - 1.0) * min(r.x, r.y); }
+void over(inout vec4 acc, vec3 c, float a) { acc = vec4(c * a, a) + acc * (1.0 - a); }
+float cov(float d) { return 1.0 - ss(-vAA, vAA, d); }
+vec3 L3() { return normalize(vec3(vLt, 1.1)); }
+// a shiny ellipsoid body part
+void part(inout vec4 acc, vec2 p, vec2 c, vec2 r, vec3 col, float gloss) {
+  float d = sdE(p, c, r);
+  vec2 q = (p - c) / r;
+  vec3 n = normalize(vec3(q * 0.9, sqrt(max(1.0 - dot(q, q) * 0.8, 0.0))));
+  vec3 L = L3(), Hh = normalize(L + vec3(0.0, 0.0, 1.0));
+  float dif = max(dot(n, L), 0.0);
+  float sp = pow(max(dot(n, Hh), 0.0), 26.0);
+  over(acc, col * (0.55 + 0.7 * dif) + vec3(0.6, 0.56, 0.5) * sp * gloss, cov(d));
+}
+float legsD(vec2 p, float ph, float sc) {
+  float dl = 1e3;
+  for (int i = 0; i < 3; i++) for (int k = 0; k < 2; k++) {
+    float sd = k == 0 ? -1.0 : 1.0;
+    float fi = float(i);
+    vec2 hip = vec2(1.85 - 0.75 * fi, 0.45 * sd);
+    vec2 foot = i == 0 ? vec2(4.6, 3.0) : i == 1 ? vec2(0.9, 4.1) : vec2(-3.7, 3.6);
+    vec2 knee = i == 0 ? vec2(2.9, 2.35) : i == 1 ? vec2(1.1, 2.75) : vec2(-0.7, 2.55);
+    float grp = (i == 1) ? -sd : sd;
+    float q = ph + (grp > 0.0 ? 0.0 : 3.14159);
+    float sw = sin(q);
+    foot.x += sw * 1.3; knee.x += sw * 0.55;
+    foot.y -= max(0.0, cos(q)) * 0.4;
+    foot *= sc; knee *= sc;
+    foot.y *= sd; knee.y *= sd;
+    dl = min(dl, min(segD(p, hip, knee) - 0.36, segD(p, knee, foot) - 0.26));
+  }
+  return dl;
+}
+vec4 ant(vec2 p) {
+  vec4 acc = vec4(0.0);
+  float ph = vB.y, aph = vB.w, carry = vC.x, tint = vC.y;
+  vec2 ps = p - vSh;
+  float dsh = min(min(sdE(ps, vec2(3.65, 0.0), vec2(1.4, 1.3)), sdE(ps, vec2(1.1, 0.0), vec2(1.7, 0.9))), sdE(ps, vec2(-3.0, 0.0), vec2(2.25, 1.7)));
+  dsh = min(dsh, legsD(ps, ph, 1.0) + 0.1);
+  over(acc, vec3(0.06, 0.035, 0.02), 0.32 * (1.0 - ss(-0.7, 1.1, dsh)));
+  vec3 dark = vec3(0.07, 0.05, 0.04);
+  float dl = legsD(p, ph, 1.0);
+  for (int k = 0; k < 2; k++) {
+    float sd = k == 0 ? -1.0 : 1.0;
+    float wb = 0.35 * sin(aph + sd * 1.7), wb2 = 0.3 * sin(aph * 1.37 + sd);
+    vec2 b0 = vec2(4.5, 0.45 * sd), b1 = vec2(5.2, (1.8 + wb) * sd), b2 = vec2(7.1 + wb2 * 0.4, (1.45 + wb + wb2) * sd);
+    dl = min(dl, min(segD(p, b0, b1) - 0.24, segD(p, b1, b2) - 0.2));
+  }
+  dl = min(dl, min(segD(p, vec2(4.6, 0.55), vec2(5.45, 0.12)), segD(p, vec2(4.6, -0.55), vec2(5.45, -0.12))) - 0.22);
+  over(acc, dark, cov(dl));
+  vec3 red = vec3(0.42, 0.17, 0.07);
+  part(acc, p, vec2(-3.0, 0.0), vec2(2.15, 1.62), dark * 1.1, 0.8);
+  // faint segment bands on the gaster
+  float band = (1.0 - ss(0.0, 0.25, abs(fract((p.x + 3.0) * 0.62 + 0.3) - 0.5) - 0.32)) * cov(sdE(p, vec2(-3.0, 0.0), vec2(1.9, 1.4)));
+  acc.rgb *= 1.0 - 0.18 * band;
+  part(acc, p, vec2(-0.75, 0.0), vec2(0.48, 0.5), mix(dark, red, tint * 0.7), 0.4);
+  part(acc, p, vec2(1.15, 0.0), vec2(1.62, 0.8), mix(dark, red, tint), 0.5);
+  part(acc, p, vec2(3.65, 0.0), vec2(1.32, 1.22), mix(dark, red * 0.8, tint * 0.55), 0.7);
+  if (carry > 0.5) {
+    int ck = int(carry + 0.5);
+    if (ck == 1) part(acc, p, vec2(6.1, 0.0), vec2(1.25, 1.05), vec3(0.88, 0.74, 0.5), 0.2);           // bread crumb
+    else if (ck == 2) {                                                                                 // sugar grain
+      vec2 q = abs(p - vec2(6.0, 0.0)) - vec2(0.95);
+      float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 0.15;
+      over(acc, vec3(0.97, 0.97, 0.95) * (1.0 - 0.12 * ss(-1.0, 1.0, dot(p - vec2(6.0, 0.0), -vLt))), cov(d));
+    }
+    else if (ck == 3) part(acc, p, vec2(6.1, 0.0), vec2(1.2, 1.2), vec3(0.72, 0.06, 0.13), 1.0);         // berry bit
+    else if (ck == 4) {                                                                                 // leaf piece, held up
+      float d = max(sdE(p, vec2(4.4, 0.0), vec2(2.7, 3.0)), -(p.x - 2.6));
+      vec3 lc = vec3(0.36, 0.6, 0.2) * (0.9 + 0.2 * dot(normalize(p - vec2(4.4, 0.0) + 1e-4), vLt));
+      lc = mix(lc, vec3(0.55, 0.75, 0.35), (1.0 - ss(0.08, 0.25, abs(p.y))) * 0.5);
+      over(acc, vec3(0.05, 0.04, 0.02), 0.3 * (1.0 - ss(-0.5, 1.0, max(sdE(p - vSh * 1.8, vec2(4.4, 0.0), vec2(2.7, 3.0)), -(p.x - vSh.x * 1.8 - 2.6)))));
+      over(acc, lc, cov(d));
+    }
+    else part(acc, p, vec2(6.3, 0.0), vec2(1.45, 0.85), vec3(0.95, 0.93, 0.86), 0.5);                   // egg / larva
+  }
+  return acc;
+}
+vec4 hole(vec2 p) {
+  vec4 acc = vec4(0.0);
+  vec2 q = p / vec2(1.0, 0.82);
+  float d = length(q);
+  vec2 dir = q / max(d, 1e-3);
+  float hn = hash2(floor(p * 0.9) + vB.w * 37.0);
+  // raised crater rim of dug-out crumbs
+  float rim = ss(11.0, 6.0, d) * ss(3.0, 5.0, d);
+  float outer = ss(4.5, 7.0, d);
+  float shade = mix(1.0 - 0.55 * dot(dir, vLt), 1.0 + 0.45 * dot(dir, vLt), outer);
+  vec3 rc = vec3(0.42, 0.30, 0.195) * shade * (0.8 + 0.4 * hn);
+  float ra = rim * mix(1.0, step(0.35, hn), ss(7.5, 10.5, d));
+  over(acc, rc, ra * 0.95);
+  // the dark entrance
+  float inner = 1.0 - ss(3.6 - vAA * 2.0, 4.6, d);
+  vec3 ic = mix(vec3(0.02, 0.014, 0.01), vec3(0.2, 0.14, 0.09), ss(0.8, 4.4, d));
+  ic += vec3(0.12, 0.08, 0.05) * max(dot(dir, -vLt), 0.0) * ss(2.0, 4.4, d);
+  over(acc, ic, inner);
+  return acc * vB.z;
+}
+vec4 crumbs(vec2 p) {
+  vec4 acc = vec4(0.0);
+  float sd = vC.y * 91.0;
+  for (int k = 3; k >= 0; k--) {
+    float fk = float(k);
+    vec2 hh = hash22(vec2(fk * 7.1, sd));
+    vec2 ck = k == 0 ? vec2(0.0) : (hh - 0.5) * 11.0;
+    float rk = k == 0 ? 3.8 : 1.1 + 1.1 * hh.x;
+    vec2 v = p - ck;
+    float a = atan(v.y, v.x);
+    float rr = rk * (1.0 + 0.16 * sin(a * 3.0 + sd + fk) + 0.08 * sin(a * 5.0 + sd * 1.7));
+    float dsh = length(v - vSh) - rr;
+    over(acc, vec3(0.06, 0.035, 0.02), 0.3 * (1.0 - ss(-0.6, 1.2, dsh)));
+    float d = length(v) - rr;
+    vec2 nq = v / rr;
+    float pore = step(0.78, hash2(floor(p * 1.4) + fk * 13.0 + sd));
+    vec3 c = mix(vec3(0.94, 0.86, 0.66), vec3(0.76, 0.52, 0.26), ss(-1.2, 0.0, d));
+    c *= 1.0 - 0.18 * pore * ss(-0.6, -1.4, d);
+    c *= 0.9 + 0.28 * dot(nq, vLt) * 0.5 + 0.1;
+    over(acc, c, cov(d));
+  }
+  return acc;
+}
+vec4 sugar(vec2 p) {
+  vec4 acc = vec4(0.0);
+  vec2 q = abs(p - vSh * 1.5) - vec2(4.0);
+  float dsh = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 0.8;
+  over(acc, vec3(0.05, 0.03, 0.02), 0.36 * (1.0 - ss(-1.0, 2.0, dsh)));
+  q = abs(p) - vec2(4.0);
+  float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 0.8;
+  float edge = ss(-1.6, 0.0, d);
+  vec2 dir = normalize(p + 1e-4);
+  vec3 c = vec3(0.965, 0.96, 0.94);
+  c *= 1.0 + edge * 0.12 * dot(dir, vLt) * 1.6 - edge * 0.05;
+  float g = hash2(floor(p * 1.3) + vC.y * 50.0);
+  c *= 0.95 + 0.08 * g;
+  c = mix(c, vec3(1.0), step(0.96, g) * 0.8);
+  over(acc, c, cov(d));
+  // a few loose grains
+  for (int k = 0; k < 3; k++) {
+    vec2 gc = (hash22(vec2(float(k) * 3.3, vC.y * 17.0)) - 0.5) * 14.0;
+    gc += normalize(gc + 1e-3) * 4.0;
+    vec2 qq = abs(p - gc) - vec2(0.55);
+    float dd = length(max(qq, 0.0)) + min(max(qq.x, qq.y), 0.0);
+    over(acc, vec3(0.97), cov(dd) * step(5.6, length(gc)));
+  }
+  return acc;
+}
+vec4 berry(vec2 p) {
+  vec4 acc = vec4(0.0);
+  over(acc, vec3(0.08, 0.02, 0.02), 0.3 * (1.0 - ss(-1.0, 1.6, length(p - vSh * 1.5) - 4.6)));
+  vec3 L = L3(), Hh = normalize(L + vec3(0.0, 0.0, 1.0));
+  for (int k = 0; k < 10; k++) {
+    float fk = float(k);
+    vec2 c = k == 0 ? vec2(0.0) : k < 7 ? 2.75 * vec2(cos(fk * 1.0472), sin(fk * 1.0472)) : 2.2 * vec2(cos(fk * 2.0 + 0.5), sin(fk * 2.0 + 0.5)) * 0.0 + vec2(3.6 * cos(fk * 2.1 + 0.4), 3.6 * sin(fk * 2.1 + 0.4));
+    float r = k < 7 ? 1.55 : 1.25;
+    vec2 v = (p - c) / r;
+    float d = (length(v) - 1.0) * r;
+    vec3 n = normalize(vec3(v, sqrt(max(1.0 - dot(v, v), 0.0))));
+    vec3 col = vec3(0.72, 0.06, 0.14) * (0.45 + 0.75 * max(dot(n, L), 0.0));
+    col += vec3(1.0, 0.9, 0.9) * pow(max(dot(n, Hh), 0.0), 30.0) * 0.8;
+    over(acc, col, cov(d));
+  }
+  return acc;
+}
+float leafD(vec2 p, float eat) {
+  float x = p.x / 8.0;
+  float w = 4.0 * pow(max(1.0 - x * x, 0.0), 0.75) * (1.0 - 0.15 * x);
+  float d = (abs(p.y) - w) * 0.85;
+  d = max(d, abs(p.x) - 8.0);
+  for (int k = 0; k < 6; k++) {
+    float fk = float(k);
+    if (fk / 6.0 < eat) {
+      float bx = -5.0 + fk * 2.1;
+      float sd = mod(fk, 2.0) < 0.5 ? 1.0 : -1.0;
+      float bw = 4.0 * pow(max(1.0 - (bx / 8.0) * (bx / 8.0), 0.0), 0.75);
+      d = max(d, -(length(p - vec2(bx, sd * bw)) - 2.1));
+    }
+  }
+  return d;
+}
+vec4 leaf(vec2 p) {
+  vec4 acc = vec4(0.0);
+  float eat = vC.w;
+  over(acc, vec3(0.04, 0.04, 0.02), 0.3 * (1.0 - ss(-1.0, 1.6, leafD(p - vSh * 1.6, eat))));
+  float d = leafD(p, eat);
+  vec3 c = mix(vec3(0.30, 0.55, 0.18), vec3(0.42, 0.64, 0.24), ss(-4.0, 4.0, p.x + p.y * 0.4));
+  float vein = (1.0 - ss(0.12, 0.3, abs(p.y))) * step(abs(p.x), 7.5);
+  float sv = 1.0 - ss(0.1, 0.28, abs(fract((p.x - abs(p.y) * 0.9) * 0.45) - 0.5) * 2.2);
+  c = mix(c, vec3(0.6, 0.78, 0.38), vein * 0.6 + sv * 0.18);
+  c *= 1.0 + 0.1 * sign(p.y) * -vLt.y * 0.0 + 0.08 * ss(-0.8, 0.0, d);
+  over(acc, c, cov(d));
+  // stalk
+  over(acc, vec3(0.35, 0.5, 0.2), cov(segD(p, vec2(-8.0, 0.0), vec2(-10.0, 0.4)) - 0.35));
+  return acc;
+}
+vec4 beetle(vec2 p) {
+  vec4 acc = vec4(0.0);
+  bool lady = vC.y < 0.5;
+  float ph = vB.y;
+  vec2 ps = p - vSh;
+  float dsh = lady ? length(ps + vec2(0.3, 0.0)) - 3.9 : sdE(ps, vec2(-0.6, 0.0), vec2(4.4, 2.5));
+  over(acc, vec3(0.05, 0.03, 0.02), 0.32 * (1.0 - ss(-0.8, 1.4, dsh)));
+  float dl = legsD(p * (lady ? 1.0 : 0.95), ph, lady ? 0.85 : 1.05);
+  dl = min(dl, min(segD(p, vec2(4.0, 0.5), vec2(5.4, 1.6)), segD(p, vec2(4.0, -0.5), vec2(5.4, -1.6))) - 0.22);
+  vec3 blk = vec3(0.05, 0.045, 0.04);
+  over(acc, blk, cov(dl));
+  vec3 L = L3(), Hh = normalize(L + vec3(0.0, 0.0, 1.0));
+  if (lady) {
+    part(acc, p, vec2(3.7, 0.0), vec2(0.8, 1.15), blk, 0.6);
+    // pronotum: black with white patches
+    float dp = sdE(p, vec2(2.5, 0.0), vec2(1.2, 2.25));
+    vec3 pc = mix(blk, vec3(0.92, 0.9, 0.85), (1.0 - ss(0.5, 0.7, length((p - vec2(2.6, 1.25 * sign(p.y))) / vec2(0.7, 0.55)))));
+    over(acc, pc, cov(dp));
+    vec2 v = (p - vec2(-0.4, 0.0)) / 3.7;
+    float d = (length(v) - 1.0) * 3.7;
+    d = max(d, p.x - 2.3 - 0.0);
+    vec3 n = normalize(vec3(v, sqrt(max(1.0 - dot(v, v), 0.0))));
+    vec3 c = vec3(0.83, 0.12, 0.05);
+    float spots = 1e3;
+    spots = min(spots, length(vec2(p.x + 0.4, abs(p.y) - 1.9)) - 0.85);
+    spots = min(spots, length(vec2(p.x - 1.3, abs(p.y) - 1.25)) - 0.6);
+    spots = min(spots, length(vec2(p.x + 2.4, abs(p.y) - 1.3)) - 0.65);
+    spots = min(spots, length(vec2(p.x - 1.9, p.y)) - 0.75);
+    c = mix(c, blk, cov(spots));
+    c = mix(c, blk * 1.5, (1.0 - ss(0.1, 0.22, abs(p.y))) * step(p.x, 1.9));
+    c = c * (0.55 + 0.7 * max(dot(n, L), 0.0)) + vec3(1.0, 0.95, 0.9) * pow(max(dot(n, Hh), 0.0), 40.0) * 0.9;
+    over(acc, c, cov(d));
+  } else {
+    part(acc, p, vec2(4.0, 0.0), vec2(0.95, 1.0), blk, 0.6);
+    part(acc, p, vec2(2.45, 0.0), vec2(1.25, 1.95), vec3(0.08, 0.2, 0.14), 1.2);
+    vec2 v = (p - vec2(-1.6, 0.0)) / vec2(3.5, 2.25);
+    float d = sdE(p, vec2(-1.6, 0.0), vec2(3.5, 2.25));
+    vec3 n = normalize(vec3(v, sqrt(max(1.0 - dot(v, v), 0.0))));
+    vec3 c = mix(vec3(0.07, 0.22, 0.15), vec3(0.22, 0.2, 0.08), 0.5 + 0.5 * n.x);
+    c *= 1.0 - 0.25 * (1.0 - ss(0.05, 0.18, abs(fract(p.y * 1.4) - 0.5)));
+    c = c * (0.55 + 0.75 * max(dot(n, L), 0.0)) + vec3(0.6, 0.9, 0.7) * pow(max(dot(n, Hh), 0.0), 22.0) * 0.6;
+    over(acc, c, cov(d));
+  }
+  return acc;
+}
+void main() {
+  int kind = int(vB.x + 0.5);
+  vec4 c;
+  if (kind == 0) c = ant(vL);
+  else if (kind == 1) c = hole(vL);
+  else if (kind == 2) c = crumbs(vL);
+  else if (kind == 3) c = sugar(vL);
+  else if (kind == 4) c = berry(vL);
+  else if (kind == 5) c = leaf(vL);
+  else c = beetle(vL);
+  o = kind == 1 ? c : c * vB.z;
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs, vs = VS) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS), PB = program(FS_BAKE), PS = program(FS_SPR, VS_SPR);
+const vaoFull = gl.createVertexArray();
+const vaoSpr = gl.createVertexArray();
+const MAXI = 1200, IST = 12;
+const inst = new Float32Array(MAXI * IST);
+const ibuf = gl.createBuffer();
+gl.bindVertexArray(vaoSpr);
+gl.bindBuffer(gl.ARRAY_BUFFER, ibuf);
+gl.bufferData(gl.ARRAY_BUFFER, inst.byteLength, gl.DYNAMIC_DRAW);
+for (let a = 0; a < 3; a++) {
+  gl.enableVertexAttribArray(a);
+  gl.vertexAttribPointer(a, 4, gl.FLOAT, false, IST * 4, a * 16);
+  gl.vertexAttribDivisor(a, 1);
+}
+gl.bindVertexArray(vaoFull);
+
+function texParams(wrap, mip) {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+}
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  texParams(gl.REPEAT, true);
+}
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+function toHalf(v) {
+  f32[0] = v;
+  const x = u32[0], s = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+  if (e <= 0) return s;
+  if (e >= 31) return s | 0x7c00;
+  return s | (e << 10) | (m >>> 13);
+}
+
+/* ======================================================================
+   Ground debris (Canvas2D, static: seed + size + details)
+   ====================================================================== */
+const ovCanvas = document.createElement('canvas');
+const ovCtx = ovCanvas.getContext('2d');
+let ovMs = 0;
+function paintDebris() {
+  const t0 = performance.now();
+  const k = cv._scale, c = ovCtx;
+  ovCanvas.width = cv.width; ovCanvas.height = cv.height;
+  c.setTransform(k, 0, 0, k, 0, 0);
+  c.clearRect(0, 0, W, H);
+  let rk = 0;
+  const R = () => hash2(rk++, 31, 4001);
+  const d = P.details, A = W * H / 1e6, per = 2 * (W + H) / 1000;
+  const shadow = (blur, ox, oy, a) => { c.shadowColor = `rgba(38,22,8,${a})`; c.shadowBlur = blur * k; c.shadowOffsetX = ox * k; c.shadowOffsetY = oy * k; };
+  const noShadow = () => { c.shadowColor = 'rgba(0,0,0,0)'; c.shadowBlur = 0; c.shadowOffsetX = 0; c.shadowOffsetY = 0; };
+  const gauss = () => (R() + R() + R() - 1.5) / 1.5;
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  // pine needles: in pairs, mostly under a few imagined pines
+  const zones = [];
+  for (let i = 0; i < 4; i++) zones.push([R() * W, R() * H, 120 + 160 * R()]);
+  const nN = Math.round((40 + 300 * d) * A);
+  shadow(1.2, 0.6, 0.9, 0.4);
+  for (let i = 0; i < nN; i++) {
+    let x, y;
+    if (R() < 0.65) { const z = zones[i % zones.length]; x = z[0] + gauss() * z[2]; y = z[1] + gauss() * z[2]; }
+    else { x = R() * W; y = R() * H; }
+    const a = R() * 6.283, L = 9 + 10 * R(), sp = 0.1 + 0.3 * R(), cb = (R() - 0.5) * 3;
+    const l = 28 + 22 * R(), dry = R();
+    c.strokeStyle = `hsl(${26 + 10 * dry},${42 + 18 * R()}%,${l}%)`;
+    c.lineWidth = 0.8;
+    for (const s of [-1, 1]) {
+      const b = a + s * sp / 2, ex = x + Math.cos(b) * L, ey = y + Math.sin(b) * L;
+      c.beginPath(); c.moveTo(x, y);
+      c.quadraticCurveTo((x + ex) / 2 - Math.sin(b) * cb, (y + ey) / 2 + Math.cos(b) * cb, ex, ey); c.stroke();
+    }
+  }
+  // twigs
+  const nT = Math.round((2 + 8 * d) * A);
+  for (let i = 0; i < nT; i++) {
+    let x = R() * W, y = R() * H, a = R() * 6.283;
+    const segs = 4 + Math.floor(R() * 4), sl = 8 + 10 * R(), lw = 1.6 + 1.8 * R();
+    const pts = [[x, y]];
+    for (let s = 0; s < segs; s++) { a += (R() - 0.5) * 0.5; x += Math.cos(a) * sl; y += Math.sin(a) * sl; pts.push([x, y]); }
+    const br = [];
+    for (let s = 1; s < segs; s++) if (R() < 0.35) {
+      const ba = a + (R() < 0.5 ? -1 : 1) * (0.5 + 0.4 * R()), bl = 6 + 10 * R(), [px, py] = pts[s];
+      br.push([px, py, px + Math.cos(ba) * bl, py + Math.sin(ba) * bl]);
+    }
+    const path = () => { c.beginPath(); c.moveTo(pts[0][0], pts[0][1]); for (const q of pts) c.lineTo(q[0], q[1]); for (const b of br) { c.moveTo(b[0], b[1]); c.lineTo(b[2], b[3]); } };
+    shadow(2, 1.2, 1.8, 0.45);
+    c.strokeStyle = `hsl(${24 + 8 * R()},${30 + 15 * R()}%,${20 + 8 * R()}%)`; c.lineWidth = lw; path(); c.stroke();
+    noShadow();
+    c.save(); c.translate(-0.35 * lw * 0.4, -0.45 * lw * 0.4);
+    c.strokeStyle = 'rgba(196,160,118,0.45)'; c.lineWidth = lw * 0.35; path(); c.stroke(); c.restore();
+  }
+  // pebbles
+  const nP = Math.round((25 + 120 * d) * A);
+  const pal = [[150, 140, 128], [176, 162, 140], [122, 112, 102], [192, 178, 152], [142, 120, 96], [168, 152, 132], [112, 100, 92], [184, 172, 160]];
+  for (let i = 0; i < nP; i++) {
+    let x = R() * W, y = R() * H;
+    let r = 1.2 + 3.2 * Math.pow(R(), 2.2);
+    if (R() < 0.06) r = 5.5 + 5 * R();
+    const e = 0.62 + 0.33 * R(), a = R() * 3.14, col = pal[Math.floor(R() * pal.length)];
+    const f = (m, o = 0) => `rgb(${Math.min(255, col[0] * m + o) | 0},${Math.min(255, col[1] * m + o) | 0},${Math.min(255, col[2] * m + o) | 0})`;
+    shadow(0.8 + 0.5 * r, 0.4 + 0.18 * r, 0.6 + 0.25 * r, 0.5);
+    c.save(); c.translate(x, y); c.rotate(a);
+    const lx = -0.35 * r, ly = -0.4 * r;   // highlight towards the top-left (rotate it back)
+    const ca = Math.cos(-a), sa = Math.sin(-a);
+    const g = c.createRadialGradient(lx * ca - ly * sa, lx * sa + ly * ca, r * 0.1, 0, 0, r * 1.05);
+    g.addColorStop(0, f(1.22, 12)); g.addColorStop(0.55, f(1)); g.addColorStop(1, f(0.7));
+    c.fillStyle = g;
+    c.beginPath(); c.ellipse(0, 0, r, r * e, 0, 0, 6.283); c.fill();
+    c.restore();
+  }
+  noShadow();
+  // fallen leaves
+  const nL = Math.round((2 + 13 * d) * A);
+  const lpal = [[181, 118, 58], [160, 82, 45], [196, 154, 69], [138, 90, 43], [156, 122, 60], [111, 127, 58], [205, 170, 80], [150, 70, 40]];
+  for (let i = 0; i < nL; i++) {
+    const x = R() * W, y = R() * H, a = R() * 6.283, type = R();
+    const L = type < 0.25 ? 12 + 6 * R() : 18 + 18 * R();
+    const wd = L * (type < 0.25 ? 0.42 : 0.24 + 0.12 * R());
+    const lobe = type > 0.75 ? 0.35 : 0, nl = 3 + Math.floor(R() * 2), bend = (R() - 0.5) * 0.25;
+    const col = lpal[Math.floor(R() * lpal.length)];
+    const pts = [];
+    for (let s = 0; s <= 40; s++) {
+      const t = s / 40, hw = wd * Math.pow(Math.sin(Math.PI * t), 0.75) * (1 - lobe * Math.abs(Math.sin(t * Math.PI * nl * 2))) * (1 - 0.2 * t);
+      pts.push([(t - 0.5) * L, hw + bend * Math.sin(Math.PI * t) * L]);
+    }
+    c.save(); c.translate(x, y); c.rotate(a);
+    c.beginPath();
+    pts.forEach((q, j) => j ? c.lineTo(q[0], q[1]) : c.moveTo(q[0], q[1]));
+    for (let j = pts.length - 1; j >= 0; j--) { const t = j / 40; c.lineTo(pts[j][0], -pts[j][1] + 2 * bend * Math.sin(Math.PI * t) * L); }
+    c.closePath();
+    const g = c.createLinearGradient(-L / 2, -wd, L / 2, wd);
+    g.addColorStop(0, `rgb(${col[0] * 0.78 | 0},${col[1] * 0.78 | 0},${col[2] * 0.78 | 0})`);
+    g.addColorStop(0.6, `rgb(${col[0]},${col[1]},${col[2]})`);
+    g.addColorStop(1, `rgb(${Math.min(255, col[0] * 1.1) | 0},${Math.min(255, col[1] * 1.1) | 0},${Math.min(255, col[2] * 1.05) | 0})`);
+    c.fillStyle = g;
+    shadow(2.5, 1.4, 2.0, 0.42);
+    c.fill();
+    noShadow();
+    // midrib + veins
+    const mid = t => bend * Math.sin(Math.PI * t) * L;
+    c.strokeStyle = `rgba(${col[0] * 0.55 | 0},${col[1] * 0.5 | 0},${col[2] * 0.45 | 0},0.6)`;
+    c.lineWidth = 0.7;
+    c.beginPath();
+    for (let s = 0; s <= 20; s++) { const t = s / 20; s ? c.lineTo((t - 0.5) * L, mid(t)) : c.moveTo(-L / 2 - 3, 0); }
+    c.stroke();
+    c.lineWidth = 0.45;
+    for (let v = 1; v <= 5; v++) {
+      const t = v / 6.5, x0 = (t - 0.5) * L, y0 = mid(t);
+      for (const s of [-1, 1]) {
+        c.beginPath(); c.moveTo(x0, y0); c.lineTo(x0 + L * 0.12, y0 + s * wd * 0.75 * Math.pow(Math.sin(Math.PI * (t + 0.06)), 0.75)); c.stroke();
+      }
+    }
+    // dry spots
+    for (let s = Math.floor(R() * 3); s > 0; s--) {
+      c.fillStyle = 'rgba(70,40,15,0.22)';
+      c.beginPath(); c.arc((R() - 0.5) * L * 0.6, (R() - 0.5) * wd * 0.8, 0.8 + 1.5 * R(), 0, 6.283); c.fill();
+    }
+    c.restore();
+  }
+  // grass tufts and clover along the screen edges (more in the corners)
+  const edgePt = () => {
+    const side = Math.floor(R() * 4), t = R(), dep = Math.pow(R(), 1.7) * (30 + 60 * d);
+    const tt = t < 0.5 ? Math.pow(t * 2, 1.6) / 2 : 1 - Math.pow((1 - t) * 2, 1.6) / 2;   // crowd the corners
+    return side === 0 ? [tt * W, dep] : side === 1 ? [tt * W, H - dep] : side === 2 ? [dep, tt * H] : [W - dep, tt * H];
+  };
+  const nG = Math.round(per * (6 + 30 * d));
+  for (let i = 0; i < nG; i++) {
+    const [x, y] = edgePt(), nb = 7 + Math.floor(R() * 9), hue = 78 + 22 * R();
+    shadow(2, 1, 1.5, 0.35);
+    for (let b = 0; b < nb; b++) {
+      const a = R() * 6.283, L = 7 + 15 * R(), w = 1.1 + 0.7 * R(), cb = (R() - 0.5) * L * 0.5;
+      const ex = x + Math.cos(a) * L, ey = y + Math.sin(a) * L, nx = -Math.sin(a), ny = Math.cos(a);
+      c.fillStyle = `hsl(${hue + (R() - 0.5) * 10},${38 + 18 * R()}%,${24 + 18 * R()}%)`;
+      c.beginPath();
+      c.moveTo(x + nx * w, y + ny * w);
+      c.quadraticCurveTo((x + ex) / 2 + nx * (cb + w * 0.5), (y + ey) / 2 + ny * (cb + w * 0.5), ex, ey);
+      c.quadraticCurveTo((x + ex) / 2 + nx * (cb - w * 0.5), (y + ey) / 2 + ny * (cb - w * 0.5), x - nx * w, y - ny * w);
+      c.closePath(); c.fill();
+    }
+    noShadow();
+  }
+  const nC = Math.round(per * (2 + 8 * d));
+  for (let i = 0; i < nC; i++) {
+    const [px, py] = edgePt(), np = 4 + Math.floor(R() * 9);
+    for (let j = 0; j < np; j++) {
+      const x = px + gauss() * 22, y = py + gauss() * 22, r = 3 + 1.8 * R(), rot = R() * 6.283;
+      const hue = 95 + 18 * R(), l = 30 + 10 * R();
+      shadow(1.8, 0.9, 1.3, 0.4);
+      for (let q = 0; q < 3; q++) {
+        const a = rot + q * 2.094, cx = x + Math.cos(a) * r * 0.85, cy = y + Math.sin(a) * r * 0.85;
+        const nx = -Math.sin(a), ny = Math.cos(a);
+        c.fillStyle = `hsl(${hue},${40 + 10 * R()}%,${l}%)`;
+        c.beginPath();
+        c.arc(cx + nx * r * 0.36 + Math.cos(a) * r * 0.12, cy + ny * r * 0.36 + Math.sin(a) * r * 0.12, r * 0.55, 0, 6.283);
+        c.arc(cx - nx * r * 0.36 + Math.cos(a) * r * 0.12, cy - ny * r * 0.36 + Math.sin(a) * r * 0.12, r * 0.55, 0, 6.283);
+        c.fill();
+        c.beginPath(); c.moveTo(x, y); c.lineTo(cx + nx * r * 0.7, cy + ny * r * 0.7); c.lineTo(cx - nx * r * 0.7, cy - ny * r * 0.7); c.closePath(); c.fill();
+      }
+      noShadow();
+      c.strokeStyle = 'rgba(225,238,205,0.45)'; c.lineWidth = 0.55;
+      for (let q = 0; q < 3; q++) {
+        const a = rot + q * 2.094, cx = x + Math.cos(a) * r * 0.75, cy = y + Math.sin(a) * r * 0.75;
+        c.beginPath(); c.arc(cx, cy, r * 0.32, a + 1.9, a + 4.4); c.stroke();
+      }
+    }
+    if (R() < 0.35) {                          // a white clover flower head
+      const x = px + gauss() * 14, y = py + gauss() * 14;
+      shadow(2, 1, 1.5, 0.4);
+      c.fillStyle = 'rgb(232,226,206)';
+      c.beginPath(); c.arc(x, y, 5, 0, 6.283); c.fill();
+      noShadow();
+      for (let q = 0; q < 22; q++) {
+        const a = q * 2.4 + R() * 0.3, rr = 1.5 + 3 * Math.sqrt(q / 22);
+        c.fillStyle = q > 14 ? 'rgb(214,196,186)' : 'rgb(248,246,238)';
+        c.beginPath(); c.ellipse(x + Math.cos(a) * rr, y + Math.sin(a) * rr, 1.5, 0.8, a, 0, 6.283); c.fill();
+      }
+    }
+  }
+  ovMs = performance.now() - t0;
+}
+
+/* ---------- baked ground textures (A/B for a cross-fade), overlay texture ---------- */
+const gtex = [null, null], gfb = [null, null];
+let gW = 0, gH = 0, gCur = 0, gT0 = -1e9, ovTex = null;
+function allocGround() {
+  for (let i = 0; i < 2; i++) {
+    if (gtex[i]) gl.deleteTexture(gtex[i]);
+    gtex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, gtex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cv.width, cv.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    texParams(gl.CLAMP_TO_EDGE, false);
+    if (!gfb[i]) gfb[i] = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, gfb[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, gtex[i], 0);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gW = cv.width; gH = cv.height;
+}
+function bakeGround(i) {
+  paintDebris();
+  if (!ovTex) ovTex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, ovTex);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, ovCanvas);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  texParams(gl.CLAMP_TO_EDGE, false);
+  const { p, U } = PB;
+  gl.useProgram(p);
+  gl.bindVertexArray(vaoFull);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, gfb[i]);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, noiseTex); gl.uniform1i(U.uNoise, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ovTex); gl.uniform1i(U.uOv, 1);
+  gl.uniform2f(U.uCv, cv.width, cv.height);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uSeed, (seed % 997) * 0.37);
+  gl.disable(gl.BLEND);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  ovCanvas.width = ovCanvas.height = 1;      // free the big canvas
+}
+function bakeAll() {
+  allocGround();
+  bakeGround(0);
+  gl.bindTexture(gl.TEXTURE_2D, gtex[1]);
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, gfb[0]);
+  gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, cv.width, cv.height);
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+  gCur = 0; gT0 = -1e9;
+}
+function bakeFade() {
+  if (!gtex[0] || gW !== cv.width || gH !== cv.height) { bakeAll(); return; }
+  const i = 1 - gCur;
+  bakeGround(i);
+  gCur = i; gT0 = performance.now();
+}
+
+/* ---------- mound field textures A/B ---------- */
+const ftex = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+let bumpK = 0;
+const BUMP = 0.18;
+const bumpAt = m => bumpK * 4 * m * (1 - m);
+function mkR16(old) {
+  if (old) gl.deleteTexture(old);
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, Gw, Gh, 0, gl.RED, gl.HALF_FLOAT, null);
+  texParams(gl.CLAMP_TO_EDGE, false);
+  return t;
+}
+function allocField() { for (let i = 0; i < 2; i++) ftex[i] = mkR16(ftex[i]); }
+function upload16(tex, s) {
+  const n = Gw * Gh, d = new Uint16Array(n);
+  for (let k = 0; k < n; k++) d[k] = toHalf(Math.max(-S_CLAMP, Math.min(s[k], S_CLAMP)));
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RED, gl.HALF_FLOAT, d);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+}
+const uploadField = (i, Fd) => upload16(ftex[i], Fd.s);
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the mounds jump when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array)) continue;
+    if (!(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    if (k === 's') {   // blend what the shader blends: the clamped channel
+      const C = S_CLAMP, cl = v => v > C ? C : v < -C ? -C : v;
+      const bu = bumpAt(m);
+      for (let i = 0; i < b.length; i++) { const x = cl(a[i]), y = cl(b[i]); r[i] = x + (y - x) * m + bu * Math.abs(y - x); }
+    } else for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  return out.s ? out : null;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  const target = 1 - toI;
+  if (fromEmpty) { FA = emptyField(); uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA);
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? GROW_MS : MORPH_MS;
+  bumpK = fromEmpty ? 0 : BUMP;
+  curMix = 0;
+  buildNests(false);
+}
+function refresh() {
+  FA = FB = computeField(iconRects());
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+  buildNests(true);
+}
+// current (blended) mound distance at a point: <0 on a mound
+function curS(x, y) {
+  if (!FB) return 999;
+  const cl = v => v > S_CLAMP ? S_CLAMP : v < -S_CLAMP ? -S_CLAMP : v;
+  const a = cl(sampleArr(FA.s, x, y)), b = cl(sampleArr(FB.s, x, y));
+  return a * (1 - curMix) + b * curMix + bumpAt(curMix) * Math.abs(a - b);
+}
+
+/* ---------- worn trails: CPU accumulation, uploaded every TR_PERIOD and cross-faded ---------- */
+let Tw = 1, Th = 1, trAcc = null, trTex = [null, null], trClock = 0, trT0 = 0, trOn = 1, trBytes = null;
+function allocTrails() {
+  Tw = Math.ceil(W / TS) + 2; Th = Math.ceil(H / TS) + 2;
+  trAcc = new Float32Array(Tw * Th); trBytes = new Uint8Array(Tw * Th);
+  for (let i = 0; i < 2; i++) {
+    if (trTex[i]) gl.deleteTexture(trTex[i]);
+    trTex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, trTex[i]);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, Tw, Th, 0, gl.RED, gl.UNSIGNED_BYTE, trBytes);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    texParams(gl.CLAMP_TO_EDGE, false);
+  }
+  trT0 = trClock;
+}
+function deposit(x, y, amt) {
+  const fx = x / TS, fy = y / TS, ix = Math.floor(fx), iy = Math.floor(fy);
+  if (ix < 0 || iy < 0 || ix >= Tw - 1 || iy >= Th - 1) return;
+  const tx = fx - ix, ty = fy - iy, i = iy * Tw + ix;
+  trAcc[i] += amt * (1 - tx) * (1 - ty); trAcc[i + 1] += amt * tx * (1 - ty);
+  trAcc[i + Tw] += amt * (1 - tx) * ty; trAcc[i + Tw + 1] += amt * tx * ty;
+}
+function uploadTrails() {
+  const dec = Math.exp(-TR_PERIOD / TR_TAU);
+  for (let i = 0; i < trAcc.length; i++) { trAcc[i] *= dec; trBytes[i] = 255 * (1 - Math.exp(-trAcc[i] / TR_K)) + 0.5; }
+  const t = trTex[0]; trTex[0] = trTex[1]; trTex[1] = t;     // what was shown (B) becomes A: no jump
+  gl.bindTexture(gl.TEXTURE_2D, trTex[1]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Tw, Th, gl.RED, gl.UNSIGNED_BYTE, trBytes);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  trT0 = trClock;
+}
+
+/* ======================================================================
+   Life: nests, holes, routes, food, ants, the odd beetle
+   ====================================================================== */
+let nests = [], holes = [], foods = [], ants = [];
+let holeId = 1, nestId = 1, foodId = 1, antId = 1;
+const routeCache = new Map();
+let foodT = 3, rawDt = 0.03;
+
+function makeRoute(ax, ay, bx, by) {
+  const L = Math.max(Math.hypot(bx - ax, by - ay), 1);
+  const nx = -(by - ay) / L, ny = (bx - ax) / L;
+  const k = (rnd() - 0.5) * 0.4 * L, wa = 2 + 3 * rnd(), wf = 6.283 / (50 + 50 * rnd()), wp = rnd() * 6.283;
+  const n = Math.max(6, Math.ceil(L / 5)), xs = new Float32Array(n + 1), ys = new Float32Array(n + 1), cum = new Float32Array(n + 1);
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, u = 1 - t, b = 2 * u * t;
+    const w = wa * Math.sin(t * L * wf + wp) * Math.sin(Math.PI * t);
+    xs[i] = u * u * ax + b * ((ax + bx) / 2 + nx * k) + t * t * bx + nx * w;
+    ys[i] = u * u * ay + b * ((ay + by) / 2 + ny * k) + t * t * by + ny * w;
+    if (i) cum[i] = cum[i - 1] + Math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]);
+  }
+  return { xs, ys, cum, len: cum[n], n };
+}
+const RP = [0, 0, 1, 0];
+function routeAt(r, u) {
+  u = Math.min(Math.max(u, 0), r.len);
+  let lo = 0, hi = r.n;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (r.cum[m] <= u) lo = m; else hi = m; }
+  const sl = r.cum[hi] - r.cum[lo] || 1, t = (u - r.cum[lo]) / sl;
+  const dx = r.xs[hi] - r.xs[lo], dy = r.ys[hi] - r.ys[lo], dl = Math.hypot(dx, dy) || 1;
+  RP[0] = r.xs[lo] + dx * t; RP[1] = r.ys[lo] + dy * t; RP[2] = dx / dl; RP[3] = dy / dl;
+  return RP;
+}
+function routeHoleFood(h, f) {
+  const key = 'h' + h.id + 'f' + f.id;
+  let r = routeCache.get(key);
+  if (!r) { r = makeRoute(h.x, h.y, f.x, f.y); r.hole = h; r.food = f; routeCache.set(key, r); }
+  return r;
+}
+function routeHoleHole(a, b) {
+  const key = 'h' + a.id + 'h' + b.id;
+  let r = routeCache.get(key);
+  if (!r) { r = makeRoute(a.x, a.y, b.x, b.y); r.hole = a; r.hole2 = b; routeCache.set(key, r); }
+  return r;
+}
+function dropRoutes(pred) { for (const [k, r] of routeCache) if (pred(r)) routeCache.delete(k); }
+
+const targetOut = () => Math.min(360, Math.round(P.ants * (24 + 30 * nests.length)));
+const desiredTotal = () => nests.length ? Math.round(targetOut() * 1.25 + nests.length * 3) : 0;
+const nearestNest = (x, y) => { let b = null, bd = 1e18; for (const n of nests) { const d = (n.x - x) ** 2 + (n.y - y) ** 2; if (d < bd) { bd = d; b = n; } } return b; };
+const nearestHole = (n, x, y) => { let b = null, bd = 1e18; for (const h of n.holes) { const d = (h.x - x) ** 2 + (h.y - y) ** 2; if (d < bd) { bd = d; b = h; } } return b; };
+
+// nests and their entrance holes from the TARGET mound field (on every commit)
+function buildNests(instant) {
+  const s = FB.s, N = Gw * Gh, lab = new Int32Array(N).fill(-1), comps = [], stack = [];
+  for (let i0 = 0; i0 < N; i0++) {
+    if (s[i0] >= -8 || lab[i0] >= 0) continue;
+    const comp = { n: 0, sx: 0, sy: 0, rim: [] };
+    lab[i0] = comps.length; stack.push(i0);
+    while (stack.length) {
+      const i = stack.pop(), x = i % Gw, y = (i / Gw) | 0;
+      comp.n++; comp.sx += x * STEP; comp.sy += y * STEP;
+      if (s[i] > -26 && s[i] < -12) comp.rim.push([x * STEP, y * STEP]);
+      const nb = [x > 0 ? i - 1 : -1, x < Gw - 1 ? i + 1 : -1, y > 0 ? i - Gw : -1, y < Gh - 1 ? i + Gw : -1];
+      for (const j of nb) if (j >= 0 && s[j] < -8 && lab[j] < 0) { lab[j] = comps.length; stack.push(j); }
+    }
+    comps.push(comp);
+  }
+  const rects = icons;
+  const inIcon = (x, y) => rects.some(r => x > r.x - 6 && x < r.x + r.w + 6 && y > r.y - 6 && y < r.y + r.h + 6);
+  const onScr = ([x, y]) => x > 16 && y > 16 && x < W - 16 && y < H - 16;
+  const oldHoles = holes.filter(h => h.live), oldNests = nests;
+  const used = new Set(), newNests = [];
+  for (const c of comps) {
+    const area = c.n * STEP * STEP;
+    if (area < 1500) continue;
+    let cand = c.rim.filter(q => onScr(q) && !inIcon(q[0], q[1]));
+    if (!cand.length) cand = c.rim.filter(onScr);
+    if (!cand.length) continue;
+    const nh = Math.max(2, Math.min(6, Math.round(Math.sqrt(area) / 70)));
+    let first = cand[0], fb = -1e9;
+    for (const q of cand) { const v = q[1] + q[0] * 0.37; if (v > fb) { fb = v; first = q; } }
+    const picks = [first], md = cand.map(q => Math.hypot(q[0] - first[0], q[1] - first[1]));
+    while (picks.length < nh) {
+      let bi = -1, bv = 40;
+      for (let i = 0; i < cand.length; i++) if (md[i] > bv) { bv = md[i]; bi = i; }
+      if (bi < 0) break;
+      const q = cand[bi]; picks.push(q);
+      for (let i = 0; i < cand.length; i++) md[i] = Math.min(md[i], Math.hypot(cand[i][0] - q[0], cand[i][1] - q[1]));
+    }
+    const nest = { id: 0, x: c.sx / c.n, y: c.sy / c.n, area, holes: [], pool: 0, emitT: rnd() };
+    for (const [x, y] of picks) {
+      let h = oldHoles.find(o => !used.has(o) && Math.hypot(o.x - x, o.y - y) < 12);
+      if (h) used.add(h);
+      else h = { id: holeId++, x, y, rot: rnd() * 6.283, seed: rnd(), alpha: instant ? 1 : 0, live: true };
+      nest.holes.push(h);
+    }
+    // keep the identity (and the ants inside) of an old nest that shares a hole
+    const old = oldNests.find(o => o.holes.some(h => nest.holes.includes(h)) && !newNests.some(n => n.id === o.id));
+    if (old) { nest.id = old.id; nest.pool = old.pool; old.keep = nest; }
+    else nest.id = nestId++;
+    newNests.push(nest);
+  }
+  for (const h of oldHoles) if (!used.has(h)) h.live = false;
+  holes = holes.filter(h => h.live || h.alpha > 0).filter(h => !newNests.some(n => n.holes.includes(h)) || true);
+  for (const n of newNests) for (const h of n.holes) if (!holes.includes(h)) holes.push(h);
+  nests = newNests;
+  // ants inside retired nests move to the nearest new one
+  for (const o of oldNests) if (!o.keep && o.pool > 0) { const n = nearestNest(o.x, o.y); if (n) n.pool += o.pool; }
+  for (const o of oldNests) delete o.keep;
+  dropRoutes(r => !r.hole.live || (r.hole2 && !r.hole2.live));
+  // ants outside: re-home the ones whose nest / hole is gone
+  const byId = new Map(nests.map(n => [n.id, n]));
+  for (const a of ants) {
+    if (!nests.length) { a.state = 'leave'; continue; }
+    const pos = [a.x, a.y];
+    if (!byId.has(a.nest.id)) a.nest = nearestNest(a.x, a.y);
+    else a.nest = byId.get(a.nest.id);
+    if (a.state === 'back' && !a.route.hole.live || a.state === 'go' && a.route.hole2 && !a.route.hole2.live) {
+      if (a.state === 'go') a.nest = nearestNest(a.route.hole2.x, a.route.hole2.y);
+      homeFrom(a, pos[0], pos[1]);
+    }
+  }
+  balance();
+}
+function homeFrom(a, x, y) {
+  const h = nearestHole(a.nest, x, y);
+  a.route = makeRoute(h.x, h.y, x, y); a.route.hole = h;
+  a.u = a.route.len; a.state = 'back'; a.food = null;
+  a.sx = a.x - x; a.sy = a.y - y;     // slip: no jump
+}
+function balance() {
+  const want = desiredTotal();
+  let have = ants.length;
+  for (const n of nests) have += n.pool;
+  let diff = want - have;
+  if (diff > 0 && nests.length) {
+    const tot = nests.reduce((s, n) => s + Math.sqrt(n.area), 0);
+    for (const n of nests) { const k = Math.round(diff * Math.sqrt(n.area) / tot); n.pool += k; }
+  } else if (diff < 0) {
+    for (const n of [...nests].sort((a, b) => b.pool - a.pool)) { const k = Math.min(n.pool, -diff); n.pool -= k; diff += k; if (!diff) break; }
+  }
+}
+
+function newAnt(nest, h) {
+  return { id: antId++, nest, x: h.x, y: h.y, hd: rnd() * 6.283, size: 0.88 + 0.24 * rnd(), tint: rnd() < 0.75 ? 0.55 + 0.45 * rnd() : 0.1 * rnd(),
+    sp: 16 + 10 * rnd(), lat: (rnd() - 0.5) * 7, lat0: (rnd() - 0.5) * 5, slow: 0, wf: 0.03 + 0.04 * rnd(), wph: rnd() * 6.283,
+    ph: rnd() * 6.283, aph: rnd() * 6.283, carry: 0, state: 'go', route: null, u: 0, food: null, ring: rnd() * 6.283,
+    timer: 0, stopT: 0, meetCD: 0, alpha: 0, sx: 0, sy: 0, turn: 0, hx: h.x, hy: h.y, ex: 0 };
+}
+function emit(nest) {
+  const live = nest.holes.filter(h => h.live && h.alpha > 0.8);
+  if (!live.length) return false;
+  const fs = foods.filter(f => f.known && !f.dying && Math.hypot(f.x - nest.x, f.y - nest.y) < 800);
+  const others = nests.filter(n => n !== nest && Math.hypot(n.x - nest.x, n.y - nest.y) < 1100);
+  const r = rnd();
+  let a;
+  if (fs.length && r < 0.7) {
+    let tot = 0; const w = fs.map(f => { const v = 1 / (Math.hypot(f.x - nest.x, f.y - nest.y) + 150); tot += v; return v; });
+    let q = rnd() * tot, f = fs[0];
+    for (let i = 0; i < fs.length; i++) { q -= w[i]; if (q <= 0) { f = fs[i]; break; } }
+    const h = nearestHole(nest, f.x, f.y);
+    if (!(h.live && h.alpha > 0.8)) return false;
+    a = newAnt(nest, h); a.route = routeHoleFood(h, f); a.food = f; a.state = 'go';
+  } else if (others.length && r < (fs.length ? 0.86 : 0.45)) {
+    others.sort((p, q) => Math.hypot(p.x - nest.x, p.y - nest.y) - Math.hypot(q.x - nest.x, q.y - nest.y));
+    const to = others[rnd() < 0.7 ? 0 : Math.floor(rnd() * others.length)];
+    let best = null, bd = 1e18;
+    for (const h of live) for (const g of to.holes) if (g.live) { const d = (h.x - g.x) ** 2 + (h.y - g.y) ** 2; if (d < bd) { bd = d; best = [h, g]; } }
+    if (!best) return false;
+    a = newAnt(nest, best[0]); a.route = routeHoleHole(best[0], best[1]); a.state = 'go'; a.dest = to;
+    if (rnd() < 0.3) a.carry = 5;      // moving an egg to the other nest
+  } else {
+    const h = live[Math.floor(rnd() * live.length)];
+    a = newAnt(nest, h); a.state = 'explore'; a.timer = 8 + 14 * rnd();
+    a.hd = Math.atan2(h.y - nest.y, h.x - nest.x) + (rnd() - 0.5) * 1.2;
+  }
+  ants.push(a);
+  return true;
+}
+
+const FOOD_R = [0, 0, 5, 5, 5, 6];         // ring radius for each food kind (local px)
+const FOOD_EXT = [0, 0, 11, 8.5, 7, 11];
+function spawnFood(known) {
+  if (!nests.length) return;
+  const hs = nests.flatMap(n => n.holes);
+  let best = null, bs = -1e9;
+  for (let c = 0; c < 20; c++) {
+    const x = 50 + rnd() * (W - 100), y = 50 + rnd() * (H - 100);
+    if (!FB || sampleArr(FB.s, x, y) < 45) continue;
+    let dh = 1e9; for (const h of hs) dh = Math.min(dh, Math.hypot(h.x - x, h.y - y));
+    if (dh < 100 || dh > 560) continue;
+    let df = 1e9; for (const f of foods) df = Math.min(df, Math.hypot(f.x - x, f.y - y));
+    if (df < 70) continue;
+    const sc = Math.min(df, 300) - Math.abs(dh - 260) * 0.4 + rnd() * 60;
+    if (sc > bs) { bs = sc; best = [x, y]; }
+  }
+  if (!best) return;
+  const q = rnd(), kind = q < 0.33 ? 2 : q < 0.53 ? 3 : q < 0.78 ? 4 : 5;
+  foods.push({ id: foodId++, kind, x: best[0], y: best[1], rot: rnd() * 6.283, seed: rnd(), amount: 1, alpha: 0,
+    known, knownT: 6 + 8 * rnd(), dying: false, base: 1.6 + 0.4 * rnd() });
+}
+const foodScale = f => f.base * (f.kind === 5 ? 0.85 + 0.15 * f.amount : 0.4 + 0.6 * Math.sqrt(Math.max(f.amount, 0)));
+
+const bug = { on: false, timer: 30 + 50 * rnd(), x: 0, y: 0, hd: 0, ph: 0, stop: 0, turn: 0, v: 0, lady: true, alpha: 0 };
+function stepBug(dt) {
+  if (!bug.on) {
+    bug.timer -= dt;
+    if (bug.timer <= 0) {
+      const side = Math.floor(rnd() * 4), t = 0.15 + 0.7 * rnd();
+      const [x, y, a] = side === 0 ? [t * W, -14, Math.PI / 2] : side === 1 ? [t * W, H + 14, -Math.PI / 2] : side === 2 ? [-14, t * H, 0] : [W + 14, t * H, Math.PI];
+      Object.assign(bug, { on: true, x, y, hd: a + (rnd() - 0.5) * 0.8, ph: 0, stop: 0, turn: 0, v: 7 + 4 * rnd(), lady: rnd() < 0.7, alpha: 1 });
+    }
+    return;
+  }
+  if (bug.stop > 0) bug.stop -= dt;
+  else {
+    if (rnd() < dt * 0.06) bug.stop = 1 + 3 * rnd();
+    bug.turn += (rnd() - 0.5) * dt * 3; bug.turn *= Math.exp(-dt * 1.5);
+    bug.hd += bug.turn * dt;
+    const ax = bug.x + Math.cos(bug.hd) * 25, ay = bug.y + Math.sin(bug.hd) * 25;
+    if (curS(ax, ay) < 12) {                       // walk round the anthills
+      const gx = curS(ax + 4, ay) - curS(ax - 4, ay), gy = curS(ax, ay + 4) - curS(ax, ay - 4);
+      const want = Math.atan2(gy, gx);
+      let d = want - bug.hd; d = Math.atan2(Math.sin(d), Math.cos(d));
+      bug.hd += Math.sign(d) * Math.min(Math.abs(d), dt * 1.2);
+    }
+    const m = bug.v * dt;
+    bug.x += Math.cos(bug.hd) * m; bug.y += Math.sin(bug.hd) * m; bug.ph += m * 1.4;
+  }
+  if (bug.x < -30 || bug.y < -30 || bug.x > W + 30 || bug.y > H + 30) { bug.on = false; bug.timer = 70 + 100 * rnd(); }
+}
+
+function antPosOnRoute(a) {
+  const r = a.route, q = routeAt(r, a.u);
+  const taper = sstep(0, 14, a.u) * (r.food ? 1 : sstep(0, 14, r.len - a.u));
+  const off = (a.lat * Math.sin(a.u * a.wf + a.wph) + a.lat0) * taper;
+  let x = q[0] - q[3] * off, y = q[1] + q[2] * off;
+  if (r.food) {
+    const f = r.food, k = sstep(r.len - 36, r.len, a.u), rr = FOOD_R[f.kind] * foodScale(f) + 4.5 * a.size;
+    x += (f.x + Math.cos(a.ring) * rr - x) * k; y += (f.y + Math.sin(a.ring) * rr - y) * k;
+  }
+  return [x, y];
+}
+function angTo(a, b, k) { let d = b - a; d = Math.atan2(Math.sin(d), Math.cos(d)); return a + d * k; }
+
+function stepLife(t, dt) {
+  const rdt = rawDt;
+  // holes fade in once the mounds have mostly grown, retired ones fade out
+  for (const h of holes) {
+    const tgt = h.live ? (curMix > 0.55 || h.alpha > 0 ? 1 : 0) : 0;
+    h.alpha += Math.max(-rdt / 0.6, Math.min(rdt / 0.6, tgt - h.alpha));
+  }
+  holes = holes.filter(h => h.live || h.alpha > 0);
+  // food
+  if (P.food > 0 && nests.length && curMix > 0.7) {
+    foodT -= dt;
+    const maxF = 1 + Math.round(3 * P.food);
+    if (foodT <= 0) {
+      if (foods.filter(f => !f.dying).length < maxF) spawnFood(false);
+      foodT = (45 - 37 * P.food) * (0.6 + 0.8 * rnd());
+    }
+  }
+  for (const f of foods) {
+    if (f.dying) f.alpha -= dt / 1.5;
+    else { f.alpha = Math.min(1, f.alpha + dt / 0.8); if (FB && sampleArr(FB.s, f.x, f.y) < 10) f.dying = true; }
+    if (!f.known) { f.knownT -= dt; if (f.knownT <= 0) f.known = true; }
+  }
+  const gone = foods.filter(f => f.alpha <= 0);
+  if (gone.length) { foods = foods.filter(f => f.alpha > 0); dropRoutes(r => r.food && gone.includes(r.food)); }
+  // nests let ants out
+  const out = ants.length, want = targetOut();
+  if (curMix > 0.6) for (const n of nests) {
+    n.emitT -= dt;
+    if (n.emitT <= 0) {
+      if (n.pool > 0 && ants.length < want && emit(n)) n.pool--;
+      n.emitT = (ants.length < want * 0.5 ? 0.15 + 0.3 * rnd() : 0.35 + 0.9 * rnd()) * Math.max(1, nests.length / 3);
+    }
+  }
+  // ants
+  const total = desiredTotal();
+  let inside = 0; for (const n of nests) inside += n.pool;
+  for (const a of ants) {
+    const ox = a.x, oy = a.y;
+    a.meetCD -= dt;
+    let v = a.sp * (0.8 + 0.3 * Math.sin(t * 1.3 + a.wph * 3)) * (a.carry ? 0.85 : 1);
+    if (a.slow > 0) { a.slow -= dt; v *= 0.3; }
+    if (a.stopT > 0) { a.stopT -= dt; v = 0; }
+    else if (rnd() < dt * 0.05) a.stopT = 0.2 + 0.5 * rnd();
+    a.aph += dt * (a.stopT > 0 || a.state === 'eat' ? 9 : 3.5);
+    let face = null;
+    if (a.state === 'go') {
+      a.u += v * dt;
+      if (a.u >= a.route.len) {
+        a.u = a.route.len;
+        if (a.route.food) { a.state = 'eat'; a.timer = 1.2 + 1.6 * rnd(); }
+        else {                                       // arrived at the other nest
+          const n = nests.includes(a.dest) ? a.dest : nearestNest(a.x, a.y);
+          if (n && inside + out <= total) n.pool++;
+          a.dead = true;
+        }
+      }
+      [a.x, a.y] = antPosOnRoute(a);
+    } else if (a.state === 'eat') {
+      const f = a.route.food;
+      [a.x, a.y] = antPosOnRoute(a);
+      a.x += Math.sin(t * 7 + a.wph) * 0.25;
+      face = Math.atan2(f.y - a.y, f.x - a.x);
+      a.timer -= dt;
+      if (a.timer <= 0 || f.dying) {
+        if (!f.dying && f.amount > 0) {
+          f.amount -= f.kind === 3 ? 0.018 : 0.028;
+          a.carry = f.kind === 2 ? 1 : f.kind === 3 ? 2 : f.kind === 4 ? 3 : 4;
+          if (f.amount <= 0.04) f.dying = true;
+        }
+        if (!nests.includes(a.nest)) a.nest = nearestNest(a.x, a.y);
+        const h = a.nest && nearestHole(a.nest, f.x, f.y);
+        if (h && h !== a.route.hole) {
+          const px = a.x, py = a.y;
+          a.route = routeHoleFood(h, f); a.u = a.route.len;
+          const [nx, ny] = antPosOnRoute(a); a.sx += px - nx; a.sy += py - ny;
+        }
+        a.state = 'back';
+      }
+    } else if (a.state === 'back') {
+      a.u -= v * dt;
+      if (a.u <= 0) {
+        if (nests.includes(a.nest) && inside + out <= total) a.nest.pool++;
+        a.dead = true;
+      }
+      [a.x, a.y] = antPosOnRoute(a);
+    } else if (a.state === 'explore') {
+      a.turn += (rnd() - 0.5) * dt * 8; a.turn *= Math.exp(-dt * 2);
+      a.hd += a.turn * dt * 2;
+      const dx = a.x - a.hx, dy = a.y - a.hy, dd = Math.hypot(dx, dy);
+      let want = null;
+      if (a.x < 20 || a.y < 20 || a.x > W - 20 || a.y > H - 20) want = Math.atan2(H / 2 - a.y, W / 2 - a.x);
+      else if (dd > 230) want = Math.atan2(-dy, -dx);
+      else if (dd > 15) {
+        const s = curS(a.x, a.y);
+        if (s < -6) want = Math.atan2(curS(a.x, a.y + 4) - curS(a.x, a.y - 4), curS(a.x + 4, a.y) - curS(a.x - 4, a.y));
+      }
+      if (want !== null) a.hd = angTo(a.hd, want, Math.min(1, dt * 2.5));
+      a.x += Math.cos(a.hd) * v * dt; a.y += Math.sin(a.hd) * v * dt;
+      a.ex += v * dt;
+      for (const f of foods) if (!f.known && Math.hypot(f.x - a.x, f.y - a.y) < 70) f.known = true;
+      a.timer -= dt;
+      if (a.timer <= 0 && a.nest) { a.sx = a.sy = 0; homeFrom(a, a.x, a.y); a.sx = a.sy = 0; }
+    } else if (a.state === 'leave') {
+      a.alpha -= dt; if (a.alpha <= 0) a.dead = true;
+      a.x += Math.cos(a.hd) * v * dt; a.y += Math.sin(a.hd) * v * dt;
+    }
+    // slip (after a re-route) melts away
+    const sk = Math.exp(-dt * 4); a.sx *= sk; a.sy *= sk;
+    const rx = a.x + a.sx, ry = a.y + a.sy;
+    const mx = rx - (a.rx === undefined ? rx : a.rx), my = ry - (a.ry === undefined ? ry : a.ry);
+    a.rx = rx; a.ry = ry;
+    const moved = Math.hypot(mx, my);
+    if (face !== null) a.hd = angTo(a.hd, face, Math.min(1, dt * 6));
+    else if (moved > 0.02 && a.state !== 'explore') a.hd = angTo(a.hd, Math.atan2(my, mx), Math.min(1, dt * 10));
+    a.ph += moved * 1.6;
+    if (moved > 0.02) deposit(rx, ry, moved * (a.state === 'explore' ? 0.02 : 0.07));
+    // fade in/out at the holes
+    if (a.state !== 'leave') {
+      const r = a.route;
+      const dh = a.state === 'explore' ? Math.min(a.ex, 99) : r ? Math.min(a.u, r.food ? 99 : r.len - a.u) : 99;
+      a.alpha = sstep(0.5, 7, dh);
+    }
+  }
+  // two ants meeting head-on stop for a moment (antennae touching)
+  for (let i = 0; i < ants.length; i++) {
+    const a = ants[i];
+    if (a.meetCD > 0 || a.state === 'eat' || a.alpha < 0.9) continue;
+    for (let j = i + 1; j < ants.length; j++) {
+      const b = ants[j];
+      if (b.meetCD > 0 || b.state === 'eat' || b.alpha < 0.9) continue;
+      const dx = b.rx - a.rx, dy = b.ry - a.ry;
+      if (dx * dx + dy * dy > 64) continue;
+      if (Math.cos(a.hd - b.hd) > 0.5) {            // same way: the one behind waits a little
+        if (dx * Math.cos(a.hd) + dy * Math.sin(a.hd) > 0) a.slow = 0.35; else b.slow = 0.35;
+        continue;
+      }
+      if (Math.cos(a.hd - b.hd) > -0.3) continue;
+      const st = 0.35 + 0.45 * rnd();
+      a.stopT = b.stopT = st; a.meetCD = b.meetCD = 3 + 3 * rnd(); b.meetCD += 0.5;
+      break;
+    }
+  }
+  if (ants.some(a => a.dead)) ants = ants.filter(a => !a.dead);
+  stepBug(dt);
+  // trails
+  trClock += dt;
+  if (trClock - trT0 >= TR_PERIOD) uploadTrails();
+  trOn += Math.max(-rdt, Math.min(rdt, (P.trails ? 1 : 0) - trOn));
+}
+
+/* ---------- sprite instances ---------- */
+let nInst = 0;
+function put(x, y, ang, size, kind, ph, alpha, aux, a2, a3, ext, a4) {
+  if (nInst >= MAXI || alpha <= 0.003) return;
+  const o = nInst++ * IST;
+  inst[o] = x; inst[o + 1] = y; inst[o + 2] = ang; inst[o + 3] = size;
+  inst[o + 4] = kind; inst[o + 5] = ph; inst[o + 6] = alpha; inst[o + 7] = aux;
+  inst[o + 8] = a2; inst[o + 9] = a3; inst[o + 10] = ext; inst[o + 11] = a4;
+}
+function buildInstances() {
+  nInst = 0;
+  for (const h of holes) put(h.x, h.y, h.rot, 1, 1, 0, h.alpha, h.seed, 0, 0, 12, 0);
+  for (const f of foods) {
+    const sc = foodScale(f);
+    put(f.x, f.y, f.rot, sc, f.kind, 0, clamp01(f.alpha), 0, 0, f.seed, FOOD_EXT[f.kind] * sc + 2, f.kind === 5 ? 1 - f.amount : 0);
+  }
+  if (bug.on) put(bug.x, bug.y, bug.hd, 1.05, 6, bug.ph, 1, 0, 0, bug.lady ? 0 : 1, 9, 0);
+  for (const a of ants) put(a.rx, a.ry, a.hd, a.size, 0, a.ph, a.alpha, a.aph, a.carry, a.tint, (a.carry === 4 ? 9.5 : 8.6) * a.size, 0);
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+  allocTrails();
+  bakeAll();
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  const sdt = dt * P.speed;
+  rawDt = dt;
+  lifeT += sdt;
+  stepLife(lifeT, sdt);
+  draw(now);
+  frameN++;
+}
+const ease = e => e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+function draw(now) {
+  const t0 = performance.now();
+  curMix = ease(Math.min(Math.max((now - morphT0) / morphDur, 0), 1));
+  if (!gtex[0] || gW !== cv.width || gH !== cv.height) bakeAll();
+  const gm = ease(Math.min(Math.max((now - gT0) / GFADE_MS, 0), 1));
+  // 1) ground + trails + mounds
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.bindVertexArray(vaoFull);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.disable(gl.BLEND);
+  const tex = [gtex[1 - gCur], gtex[gCur], ftex[fromI], ftex[toI], trTex[0], trTex[1]];
+  ['uG0', 'uG1', 'uCA', 'uCB', 'uTA', 'uTB'].forEach((nm, i) => {
+    gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, tex[i]); gl.uniform1i(U[nm], i);
+  });
+  gl.uniform2f(U.uCv, cv.width, cv.height);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform2f(U.uTGrid, Tw, Th);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uTS, TS);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uBump, bumpAt(curMix));
+  gl.uniform1f(U.uGMix, gm);
+  gl.uniform1f(U.uTMix, Math.min(1, (trClock - trT0) / TR_PERIOD));
+  gl.uniform1f(U.uTOn, trOn);
+  gl.uniform1f(U.uRH, Math.min(Math.max(P.sigma * 1.3, 40), 110));
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // 2) sprites
+  buildInstances();
+  if (nInst) {
+    gl.useProgram(PS.p);
+    gl.bindVertexArray(vaoSpr);
+    gl.bindBuffer(gl.ARRAY_BUFFER, ibuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, inst, 0, nInst * IST);
+    gl.uniform2f(PS.U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+    gl.uniform1f(PS.U.uScale, cv._scale);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, nInst);
+    gl.disable(gl.BLEND);
+    gl.bindVertexArray(vaoFull);
+  }
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise();
+  bakeFade();
+  if (iconsSeen && FB) commit(); else refresh();
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false, ground = false, pop = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    P[k] = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'trails') P[k] = P[k] >= 0.5 ? 1 : 0;
+    if (k === 'sigma') field = true;
+    if (k === 'details') ground = true;
+    if (k === 'ants') pop = true;
+  }
+  if (ground) bakeFade();
+  if (field && FB) commit();
+  if (pop) balance();
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;       // physical -> CSS pixels
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: mounds grow in; later: smooth transition
+    if (first) { foodT = 4; for (let i = Math.round(1 + 2 * P.food); i > 0; i--) spawnFood(true); }
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+  for (let i = Math.round(1 + 2 * P.food); i > 0; i--) spawnFood(true);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); }, 100);
+});
+
+window.__dbg = {
+  P,
+  stats: () => ({ fieldMs, ovMs, frameMs, fps: fpsEMA, nests: nests.length, holes: holes.length, ants: ants.length, foods: foods.length, inst: nInst,
+    pool: nests.reduce((s, n) => s + n.pool, 0) }),
+  // dev: run the colony forward (trails build up), then draw
+  warm(sec) {
+    for (let i = 0; i < sec * 30; i++) { rawDt = 1 / 30; lifeT += 1 / 30; stepLife(lifeT, 1 / 30); }
+    uploadTrails(); trT0 = trClock - TR_PERIOD;
+    draw(performance.now());
+  },
+  sprites: () => { const r = []; for (let i = 0; i < nInst; i++) r.push([inst[i * IST], inst[i * IST + 1], inst[i * IST + 10]]); return r; },
+  bug,
+};
+buildNoiseTex();
+resize();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>

@@ -64,27 +64,75 @@ final class HostWeb: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKU
       if (window.chrome && window.chrome.webview) return;
       const listeners = [];
       window.chrome = window.chrome || {};
+      const wallpaper = /[?&]wallpaper=1/.test(location.search);
+      let recording = false;                    // a share video is being recorded: always full frame rate
       window.chrome.webview = {
-        postMessage(m) { window.webkit.messageHandlers.host.postMessage(typeof m === 'string' ? m : JSON.stringify(m)); },
+        postMessage(m) {
+          const s = typeof m === 'string' ? m : JSON.stringify(m);
+          if (s.startsWith('record|')) recording = false;
+          window.webkit.messageHandlers.host.postMessage(s);
+        },
         addEventListener(type, fn) { if (type === 'message') listeners.push(fn); },
         removeEventListener(type, fn) { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); }
       };
+
+      // Frame governor (wallpaper only). The themes cap themselves at 30 fps by skipping frames, but their
+      // requestAnimationFrame loop still wakes on every display refresh (120 Hz on ProMotion) and keeps spinning
+      // while paused. Instead, sleep in a timer until the next frame is due and only then ask for a vsync-aligned
+      // frame; while the page is paused, hold its callback and just check back a few times a second.
+      if (wallpaper) {
+        const raf = window.requestAnimationFrame.bind(window);
+        let cbs = [], pending = false, last = 0;
+        window.__frameMs = 1000 / 30;           // set by the host's power profile
+        const pagePaused = () => { try { return paused === true; } catch (e) { return false; } };   // the theme's global
+        const fire = now => {
+          pending = false; last = now;
+          const list = cbs; cbs = [];
+          for (const cb of list) { try { cb(now); } catch (e) { console.error(e); } }
+        };
+        const pump = () => {
+          if (pending || !cbs.length) return;
+          pending = true;
+          if (pagePaused() && !recording) { setTimeout(() => { pending = false; pump(); }, 250); return; }
+          const wait = last + (recording ? 1000 / 30 : window.__frameMs) - performance.now() - 2;   // wake a hair early, rAF snaps to vsync
+          if (wait > 1) setTimeout(() => raf(fire), wait); else raf(fire);
+        };
+        window.requestAnimationFrame = cb => { cbs.push(cb); pump(); return cbs.length; };
+        window.cancelAnimationFrame = () => {};   // the themes never cancel their loop
+      }
+
+      // Power profile from the host: frame interval and render resolution (the themes' P.quality caps devicePixelRatio).
+      function applyPower(fps, quality) {
+        window.__frameMs = 1000 / fps;
+        try {
+          if (typeof P === 'object' && P && typeof P.quality === 'number' && P.quality !== quality) {
+            P.quality = quality;
+            window.dispatchEvent(new Event('resize'));   // the theme re-sizes its canvas (debounced)
+          }
+        } catch (e) {}
+      }
+
       // The theme pages time the icon morph with wall-clock time but stop their frame loop while paused,
       // so a morph that starts during a pause would be "over" before the first frame is drawn and the
       // scenery would jump. Remember such a morph and restart it when the pause ends.
-      let paused = false, morphPending = false;
+      let hostPaused = false, morphPending = false;
       window.__hostPost = function (s) {
+        if (s.startsWith('{"t":"power"')) {
+          try { const m = JSON.parse(s); applyPower(m.fps, m.quality); } catch (e) {}
+          return;
+        }
+        if (s.startsWith('{"t":"record"')) recording = true;
         const ev = { data: s };
         for (const fn of listeners.slice()) { try { fn(ev); } catch (e) { console.error(e); } }
         if (s.startsWith('{"t":"pause"')) {
           const p = s.indexOf('true') > 0;
-          if (paused && !p && morphPending && typeof morphT0 === 'number' && typeof morphDur === 'number') {
+          if (hostPaused && !p && morphPending && typeof morphT0 === 'number' && typeof morphDur === 'number') {
             morphT0 = performance.now();          // play the deferred transition now that frames are drawn
             if (typeof curMix === 'number') curMix = 0;
           }
           if (!p) morphPending = false;
-          paused = p;
-        } else if (s.startsWith('{"t":"icons"') && paused) {
+          hostPaused = p;
+        } else if (s.startsWith('{"t":"icons"') && hostPaused) {
           morphPending = true;
         }
       };

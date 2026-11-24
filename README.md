@@ -17,6 +17,7 @@ Iconland is a macOS port of [Deskland Preview](https://github.com/BLEZZ0102/Desk
 | <img src="web/thumbs/archipelago.webp" width="160"> | **Archipelago** | Icons become lush islands ringed by surf, with sailing ships voyaging between them. |
 | <img src="web/thumbs/oldmap.webp" width="160"> | **Old Sea Chart** | An antique inked sea chart. Click a ship to take the helm: WASD or arrows to sail, click to set a course, Esc to let it go. |
 | <img src="web/thumbs/oldland.webp" width="160"> | **Old Land Map** | An antique map of forests, mountains and towns; icons rest in lakes or on open plains. |
+| <img src="web/thumbs/anthill.webp" width="160"> | **Ant Colony** | A sunny patch of forest floor; every group of icons becomes an anthill, and ants carry crumbs and berries along trails between the nests. |
 | <img src="web/thumbs/winterlake.webp" width="160"> | **Winter Lake** | Icons melt pools of open water in the ice; skaters glide around them and leave traces while snow falls. |
 | <img src="web/thumbs/blockworld.webp" width="160"> | **Block World** | A blocky pixel-art world: icons stand in flat clearings joined by paths, and the land is rebuilt block by block when they move. |
 | <img src="web/thumbs/space.webp" width="160"> | **Deep Space** | Icons sit in the dark heart of glowing nebulae among stars, comets, a ringed planet and a small rocket. |
@@ -45,9 +46,11 @@ The app is built for the architecture of the Mac you build on and is ad-hoc sign
 Iconland lives in the menu bar (mountain icon) and has no Dock icon unless the settings window is open.
 
 - **First launch** opens the settings window. macOS asks whether Iconland may control Finder; allow it, or the scenery cannot follow your icons. You can change this later in System Settings → Privacy & Security → Automation.
-- **Menu bar menu**: Settings, Theme, Pause animation, Reload, Start with Mac, Quit.
+- **Menu bar menu**: Settings, Theme, Pause animation, Sound, Reload, Start with Mac, Quit.
+- **Sound**: most themes play their own generated music and nature sounds (no recordings, nothing downloaded). Turn it off or set the volume in the menu or the settings window; it goes quiet while the display sleeps, the screen is locked or the animation is paused by hand.
 - **Share** buttons in the settings window save a picture or a short clip of the current scenery to `~/Pictures/Iconland` and put it on the clipboard.
-- The animation pauses by itself when a window covers the whole screen, the display sleeps or the screen is locked.
+- The animation pauses by itself when a window covers the whole screen, several windows together hide almost all of the desktop, the display sleeps or the screen is locked.
+- **Battery saving**: on power the wallpaper draws 30 frames a second at full resolution, on battery 24 at reduced resolution, and in Low Power Mode 15.
 
 The interface is in English and Russian and follows the system language unless you pick one in settings.
 
@@ -74,7 +77,8 @@ Iconland asks Finder only for the positions of the items on your desktop and the
 ## How it works
 
 - `Sources/Iconland/` is the host, a small AppKit app.
-  - `Wallpaper.swift` puts a borderless, click-through window at the desktop level, above the system wallpaper and below Finder's icons, and decides when to pause.
+  - `Wallpaper.swift` puts a borderless, click-through window at the desktop level, above the system wallpaper and below Finder's icons, decides when to pause, and picks the power profile.
+  - `Sound.swift` decides when the theme's sound may play; the sound itself is generated in `web/sound.js`.
   - `IconReader.swift` asks Finder for icon positions over Apple Events about once a second.
   - `HostWeb.swift` wraps `WKWebView`, serves `web/` under the `iconland://` scheme and gives pages the `window.chrome.webview` messaging API that the upstream Windows host provides, so theme pages run unchanged.
   - `Steering.swift` handles taking the helm of a ship in Old Sea Chart.
@@ -87,6 +91,7 @@ Iconland asks Finder only for the positions of the items on your desktop and the
 swift build                                         # debug build; logs also go to stderr
 ICONLAND_WEB="$PWD/web" swift run Iconland          # run against the working copy of web/
 ICONLAND_DEBUG=1 build/Iconland.app/Contents/MacOS/Iconland   # log frame rate and icon counts to host.log
+ICONLAND_POWER=battery build/Iconland.app/Contents/MacOS/Iconland   # force a power profile: full, battery or low
 ```
 
 Web Inspector is enabled for both web views: Safari → Develop → *your Mac* → Iconland.
@@ -114,7 +119,8 @@ It is based on [Deskland Preview](https://github.com/BLEZZ0102/Deskland), Copyri
 
 - A native macOS host written in Swift replaces the Windows host.
 - The app has its own name and icon, as the upstream trademark policy asks of modified versions.
-- Eleven themes were added to upstream's Beach and Meadow: Woods, High Sea, Pond, Cloud Sky, Archipelago, Old Sea Chart, Old Land Map, Winter Lake, Block World, Deep Space and Cyberpunk.
+- Twelve themes were added to upstream's Beach and Meadow: Woods, High Sea, Pond, Cloud Sky, Archipelago, Old Sea Chart, Old Land Map, Ant Colony, Winter Lake, Block World, Deep Space and Cyberpunk.
+- Generated music and ambience for the themes, and power profiles that save battery.
 - A Russian translation was added; the Chinese one is not included.
 
 [NOTICE.upstream](NOTICE.upstream) is the upstream notice, kept verbatim. The `THIRD_PARTY_NOTICES.md` and `TRADEMARKS.md` it mentions are files in the upstream repository; they are not copied here because the third-party components they cover (WebView2, NSIS) belong to the Windows host, which this port does not use. Iconland itself has no third-party dependencies beyond the system frameworks.

@@ -9,6 +9,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private let steering = Steering()
     private let reader = IconReader()
     private let pause = PauseMonitor()
+    private let soundGate = SoundGate()
+    private let power = PowerMonitor()
     private var iconTimer: Timer?
     private var lastIcons = ""                 // last "icons" JSON (physical pixels)
     private var wallReady = false
@@ -41,6 +43,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
         setupStatusItem()
         pause.onChange = { [weak self] p in self?.postPause(p) }
+        soundGate.enabled = settings.sound
+        soundGate.onChange = { [weak self] _ in self?.postSound() }
+        power.onChange = { [weak self] _ in self?.postPower() }
         startWallpaper()
 
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
@@ -115,7 +120,30 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         wallpaper?.web.post(JSON.string(["t": "settings", "v": settings.values(for: settings.theme)]))
         lastIcons = ""
         pollIcons()
+        postPower()
         postPause(pause.paused, force: true)
+        postSound()
+    }
+
+    /// Music + ambience of the theme page: on/off and volume (see SoundGate for when it goes quiet).
+    private func postSound() {
+        guard wallReady else { return }
+        wallpaper?.web.post(JSON.string(["t": "sound", "on": soundGate.audible, "vol": settings.volume] as [String: Any]))
+    }
+
+    private func setSound(on: Bool? = nil, volume: Double? = nil) {
+        if let on { settings.sound = on; soundGate.enabled = on }
+        if let volume { settings.volume = min(max(volume, 0), 1) }
+        settings.saveSoon()
+        postSound()
+        updateMenuState()
+    }
+
+    /// Frame rate and render resolution for the current power source (see PowerMonitor).
+    private func postPower() {
+        guard wallReady else { return }
+        let p = PowerMonitor.profile(power.mode)
+        wallpaper?.web.post("{\"t\":\"power\",\"fps\":\(p.fps),\"quality\":\(p.quality)}")
     }
 
     private var lastPause: Bool?
@@ -201,6 +229,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private var pauseItem: NSMenuItem?
+    private var soundItem: NSMenuItem?
     private var autostartItem: NSMenuItem?
 
     private func rebuildMenu() {
@@ -224,6 +253,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
         pauseItem = item(Lang.menu("pause", l), #selector(togglePause))
         menu.addItem(pauseItem!)
+        soundItem = item(Lang.menu("sound", l), #selector(toggleSound))
+        menu.addItem(soundItem!)
         menu.addItem(item(Lang.menu("reload", l), #selector(reload), key: "r"))
         autostartItem = item(Lang.menu("autostart", l), #selector(toggleAutostart))
         menu.addItem(autostartItem!)
@@ -237,6 +268,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func updateMenuState() {
         pauseItem?.state = pause.manual ? .on : .off
+        soundItem?.state = settings.sound ? .on : .off
         autostartItem?.state = isAutostart ? .on : .off
     }
 
@@ -252,7 +284,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         settingsWeb?.post(JSON.string(["t": "themeChanged", "id": id]))
     }
 
-    @objc private func togglePause() { pause.manual.toggle() }
+    @objc private func togglePause() { pause.manual.toggle(); soundGate.manualPause = pause.manual }
+
+    @objc private func toggleSound() {
+        setSound(on: !settings.sound)
+        settingsWeb?.post(JSON.string(["t": "sound", "on": settings.sound, "vol": settings.volume] as [String: Any]))
+    }
 
     @objc private func reload() {
         themes = ThemeRegistry.load(lang: lang)
@@ -339,6 +376,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 "screen": ["w": Int(screen.frame.width * k), "h": Int(screen.frame.height * k)],
                 "autostart": isAutostart, "autostartWarn": false, "autostartSw": "",
                 "lang": settings.lang, "langEff": lang, "langSys": Lang.system,
+                "sound": settings.sound, "volume": settings.volume,
             ] as [String: Any]))
             if !lastIcons.isEmpty { web.post(lastIcons) }
         case "set":
@@ -364,6 +402,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             themes = ThemeRegistry.load(lang: lang)
             rebuildMenu()
             web.post(JSON.string(["t": "lang", "v": v, "eff": lang, "sys": Lang.system]))
+        case "sound":
+            setSound(on: m["on"] as? Bool, volume: (m["vol"] as? NSNumber)?.doubleValue)
         case "autostart":
             setAutostart(m["v"] as? Bool ?? false)
         case "share":

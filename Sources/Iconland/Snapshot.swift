@@ -77,6 +77,10 @@ final class SnapshotRunner: NSObject {
             self.web.post(JSON.string(["t": "settings", "v": self.settings]))
             self.web.post(self.iconsJSON(self.rects))
             self.web.post(JSON.string(["t": "pause", "v": false]))
+            if ProcessInfo.processInfo.environment["ICONLAND_POWER"] != nil {   // render with that power profile
+                let p = PowerMonitor.profile(PowerMonitor.current())
+                self.web.post("{\"t\":\"power\",\"fps\":\(p.fps),\"quality\":\(p.quality)}")
+            }
             if let mv = self.moveAt {
                 DispatchQueue.main.asyncAfter(deadline: .now() + mv) {
                     let moved = self.rects.enumerated().map { i, r in i >= 9 ? r.offsetBy(dx: 260, dy: 90) : r }

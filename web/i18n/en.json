@@ -9,6 +9,9 @@
     "langAuto": "System default",
     "langAutoWith": "System default ({name})",
     "autostart": "Start with Mac",
+    "sound": "Sound",
+    "soundTitle": "Music and nature sounds of the theme",
+    "volume": "Volume",
     "autostartTitle": "Open Iconland automatically when you log in to your Mac",
     "autostartBlocked": "Start with Mac may have been blocked",
     "autostartWarnSw": "Iconland didn't open automatically this time — {sw} may have blocked it. Open {sw} and allow Iconland, then check that Iconland is turned on in System Settings → General → Login Items.",
@@ -438,6 +441,45 @@
         "speed": {
           "label": "Animation speed",
           "hint": "How fast the carriages travel"
+        }
+      }
+    },
+    "anthill": {
+      "name": "Ant Colony",
+      "desc": "A sunny patch of forest floor seen from above: every group of icons becomes an anthill, and ants run along worn trails between the nests, carrying crumbs, sugar and berries home. Now and then a ladybug wanders by",
+      "groups": [
+        "Anthills",
+        "Ants",
+        "Ground"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Anthill size",
+          "hint": "How far the anthills under your icons spread"
+        },
+        "ants": {
+          "label": "Number of ants",
+          "hint": "How many ants are out and about (more nests, more ants)"
+        },
+        "food": {
+          "label": "Food",
+          "hint": "How often crumbs, sugar cubes, berries and leaves turn up"
+        },
+        "trails": {
+          "label": "Ant trails",
+          "hint": "Where ants walk often, a lighter path is slowly worn into the soil",
+          "options": [
+            "Hide",
+            "Show"
+          ]
+        },
+        "speed": {
+          "label": "Animation speed",
+          "hint": "How fast the ants and the ladybug crawl"
+        },
+        "details": {
+          "label": "Ground details",
+          "hint": "How many pebbles, fallen leaves, pine needles and twigs, plus the grass and clover along the edges"
         }
       }
     },

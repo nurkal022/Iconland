@@ -5,6 +5,8 @@ final class Settings {
     var theme = "beach"
     var params: [String: [String: Any]] = [:]   // theme id → { key: value }
     var lang = "auto"                            // "auto" | "en" | "ru"
+    var sound = true                             // theme music + nature sounds
+    var volume = 0.5                             // 0...1
 
     private let url = Paths.support.appendingPathComponent("settings.json")
     private var pending: DispatchWorkItem?
@@ -17,6 +19,8 @@ final class Settings {
         if let t = root["theme"] as? String { theme = t }
         if let p = root["params"] as? [String: [String: Any]] { params = p }
         if let l = root["lang"] as? String { lang = l }
+        if let v = root["sound"] as? Bool { sound = v }
+        if let v = root["volume"] as? Double { volume = min(max(v, 0), 1) }
     }
 
     /// The file exists but isn't valid settings JSON: the next save would overwrite it with defaults,
@@ -57,7 +61,7 @@ final class Settings {
 
     func saveNow() {
         pending?.cancel(); pending = nil
-        let root: [String: Any] = ["theme": theme, "params": params, "lang": lang]
+        let root: [String: Any] = ["theme": theme, "params": params, "lang": lang, "sound": sound, "volume": volume]
         do {
             let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: url, options: .atomic)
@@ -118,6 +122,7 @@ enum Lang {
             "pause":     ["en": "Pause animation", "ru": "Приостановить анимацию"],
             "reload":    ["en": "Reload", "ru": "Перезагрузить"],
             "autostart": ["en": "Start with Mac", "ru": "Запускать вместе с Mac"],
+            "sound":     ["en": "Sound", "ru": "Звук"],
             "quit":      ["en": "Quit \(appName)", "ru": "Выйти из \(appName)"],
             "noAccess":  ["en": "Allow access to Finder…", "ru": "Разрешить доступ к Finder…"],
         ]
